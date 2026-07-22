@@ -8,6 +8,7 @@ import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.stattools import durbin_watson
 from scipy import stats
+import itertools
 
 app = FastAPI()
 
@@ -27,6 +28,12 @@ class AnalysisRequest(BaseModel):
 class MultipleTTestRequest(BaseModel):
     depVars: List[str]
     groupVar: str
+    data: List[Dict[str, Any]]
+
+class MultipleANOVARequest(BaseModel):
+    depVars: List[str]
+    groupVar: str
+    postHoc: str
     data: List[Dict[str, Any]]
 
 @app.get("/ping")
@@ -150,6 +157,88 @@ def ttest_multiple(req: MultipleTTestRequest):
         return {
             "groupVar": req.groupVar,
             "originalGroups": [str(g1_val), str(g2_val)],
+            "results": results
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/anova-multiple")
+def anova_multiple(req: MultipleANOVARequest):
+    try:
+        df = pd.DataFrame(req.data)
+        df = df.dropna(subset=[req.groupVar])
+        
+        # Grupları ismine göre sıralı olarak al
+        unique_groups = list(df[req.groupVar].unique())
+        unique_groups.sort(key=lambda x: str(x))
+        
+        if len(unique_groups) < 2:
+            return {"error": f"ANOVA için grup değişkeninizde en az 2, tercihen 3 veya daha fazla kategori olmalıdır. Sizde {len(unique_groups)} bulundu."}
+        
+        results = []
+        for var in req.depVars:
+            temp_df = df.dropna(subset=[var])
+            
+            group_stats = []
+            group_data_list = []
+            
+            total_data = pd.to_numeric(temp_df[var], errors='coerce').dropna().values
+            tot_n = len(total_data)
+            if tot_n == 0: continue
+            
+            tot_mean = float(np.mean(total_data))
+            tot_std = float(np.std(total_data, ddof=1)) if tot_n > 1 else 0.0
+            
+            for g in unique_groups:
+                g_data = temp_df[temp_df[req.groupVar] == g][var]
+                g_data = pd.to_numeric(g_data, errors='coerce').dropna().values
+                group_data_list.append(g_data)
+                
+                n = len(g_data)
+                mean = float(np.mean(g_data)) if n > 0 else 0.0
+                std = float(np.std(g_data, ddof=1)) if n > 1 else 0.0
+                group_stats.append({"val": str(g), "n": n, "mean": mean, "std": std})
+            
+            # ANOVA F ve P değeri
+            try:
+                F_stat, p_val = stats.f_oneway(*group_data_list)
+            except:
+                F_stat, p_val = 0.0, 1.0
+            
+            post_hoc_pairs = []
+            
+            # Eğer Anlamlı Fark Varsa Post-Hoc Yap (LSD veya Bonferroni)
+            if not np.isnan(p_val) and p_val < 0.05:
+                pairs = list(itertools.combinations(range(len(unique_groups)), 2))
+                num_comparisons = len(pairs)
+                
+                for i, j in pairs:
+                    if len(group_data_list[i]) < 2 or len(group_data_list[j]) < 2: continue
+                    
+                    t_stat, pair_p = stats.ttest_ind(group_data_list[i], group_data_list[j], equal_var=True)
+                    
+                    # Bonferroni Düzeltmesi (LSD ise doğrudan pair_p alınır)
+                    adj_p = pair_p * num_comparisons if req.postHoc == 'Bonferroni' else pair_p
+                    
+                    if adj_p < 0.05:
+                        if group_stats[i]["mean"] > group_stats[j]["mean"]:
+                            post_hoc_pairs.append({"higher": str(unique_groups[i]), "lower": str(unique_groups[j])})
+                        else:
+                            post_hoc_pairs.append({"higher": str(unique_groups[j]), "lower": str(unique_groups[i])})
+            
+            results.append({
+                "varName": var,
+                "F": float(F_stat) if not np.isnan(F_stat) else 0.0,
+                "p": float(p_val) if not np.isnan(p_val) else 1.0,
+                "groups": group_stats,
+                "total": {"n": tot_n, "mean": tot_mean, "std": tot_std},
+                "postHocPairs": post_hoc_pairs
+            })
+
+        return {
+            "groupVar": req.groupVar,
+            "postHoc": req.postHoc,
+            "originalGroups": [str(g) for g in unique_groups],
             "results": results
         }
     except Exception as e:
