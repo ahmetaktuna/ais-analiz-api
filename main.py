@@ -11,7 +11,6 @@ from scipy import stats
 
 app = FastAPI()
 
-# Web sitenizden gelecek isteklere (CORS) izin veriyoruz
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,19 +24,15 @@ class AnalysisRequest(BaseModel):
     indepVars: List[str]
     data: List[Dict[str, Any]]
 
-class TTestRequest(BaseModel):
-    depVar: str
+class MultipleTTestRequest(BaseModel):
+    depVars: List[str]
     groupVar: str
     data: List[Dict[str, Any]]
 
-# UYKU ENGELLEYİCİ PING ADRESİMİZ
 @app.get("/ping")
 def ping():
     return {"status": "Uyanigim ve hazirim!"}
 
-# ==========================================
-# 1. REGRESYON HESAPLAMA MOTORU
-# ==========================================
 @app.post("/analyze")
 def analyze(req: AnalysisRequest):
     try:
@@ -82,14 +77,9 @@ def analyze(req: AnalysisRequest):
         
         for i, (var, d_name) in enumerate(zip(vars_list, display_names)):
             coeffData.append({
-                "name": d_name,
-                "B": float(model.params[var]),
-                "SE": float(model.bse[var]),
-                "Beta": betas[i],
-                "t": float(model.tvalues[var]),
-                "p": float(model.pvalues[var]),
-                "Tol": tolerances[i],
-                "VIF": vifs[i]
+                "name": d_name, "B": float(model.params[var]), "SE": float(model.bse[var]),
+                "Beta": betas[i], "t": float(model.tvalues[var]), "p": float(model.pvalues[var]),
+                "Tol": tolerances[i], "VIF": vifs[i]
             })
             
         return {
@@ -101,81 +91,66 @@ def analyze(req: AnalysisRequest):
     except Exception as e:
         return {"error": str(e)}
 
-# ==========================================
-# 2. BAĞIMSIZ ÖRNEKLEM T-TEST MOTORU
-# ==========================================
-@app.post("/ttest-independent")
-def ttest_independent(req: TTestRequest):
+@app.post("/ttest-multiple")
+def ttest_multiple(req: MultipleTTestRequest):
     try:
         df = pd.DataFrame(req.data)
+        df = df.dropna(subset=[req.groupVar])
         
-        # Bağımlı değişkeni sayısal yap, boşları sil
-        df[req.depVar] = pd.to_numeric(df[req.depVar], errors='coerce')
-        df = df.dropna(subset=[req.depVar, req.groupVar])
-        
-        # Grupları belirle
         unique_groups = df[req.groupVar].unique()
         if len(unique_groups) != 2:
-            return {"error": f"Bağımsız örneklem t-testi için grup değişkeninizde tam olarak 2 farklı kategori olmalıdır. Sizde {len(unique_groups)} kategori bulundu: {list(unique_groups)}"}
+            return {"error": f"Grup değişkeninizde tam olarak 2 kategori olmalıdır. Sizde {len(unique_groups)} bulundu."}
         
-        g1_name, g2_name = unique_groups[0], unique_groups[1]
-        data1 = df[df[req.groupVar] == g1_name][req.depVar].values
-        data2 = df[df[req.groupVar] == g2_name][req.depVar].values
+        g1_val, g2_val = unique_groups[0], unique_groups[1]
         
-        n1, n2 = len(data1), len(data2)
-        if n1 < 2 or n2 < 2:
-            return {"error": "Gruplardan birinde yeterli veri yok (En az 2 veri olmalı)."}
-
-        # 1. Betimsel İstatistikler
-        desc = {
-            "g1": {"name": str(g1_name), "n": n1, "mean": float(np.mean(data1)), "std": float(np.std(data1, ddof=1)), "se": float(np.std(data1, ddof=1)/np.sqrt(n1))},
-            "g2": {"name": str(g2_name), "n": n2, "mean": float(np.mean(data2)), "std": float(np.std(data2, ddof=1)), "se": float(np.std(data2, ddof=1)/np.sqrt(n2))}
-        }
-        
-        # 2. Varsayım Testleri
-        # Normallik (Shapiro-Wilk)
-        try:
-            stat_s1, p_s1 = stats.shapiro(data1)
-            stat_s2, p_s2 = stats.shapiro(data2)
-        except:
-            stat_s1, p_s1, stat_s2, p_s2 = None, None, None, None
+        results = []
+        for var in req.depVars:
+            # Temizle
+            temp_df = df.dropna(subset=[var])
+            data1 = temp_df[temp_df[req.groupVar] == g1_val][var]
+            data2 = temp_df[temp_df[req.groupVar] == g2_val][var]
             
-        # Homojenlik (Levene Test)
-        try:
-            stat_lev, p_lev = stats.levene(data1, data2, center='mean')
-        except:
-            stat_lev, p_lev = None, None
-
-        # 3. T-Testleri (Eşit ve Eşit Olmayan Varyanslar)
-        t_eq, p_eq = stats.ttest_ind(data1, data2, equal_var=True)
-        df_eq = n1 + n2 - 2
-        
-        t_uneq, p_uneq = stats.ttest_ind(data1, data2, equal_var=False)
-        # Welch Satterthwaite df
-        v1 = np.var(data1, ddof=1)
-        v2 = np.var(data2, ddof=1)
-        num = (v1/n1 + v2/n2)**2
-        den = (v1/n1)**2/(n1-1) + (v2/n2)**2/(n2-1)
-        df_uneq = num/den if den != 0 else df_eq
-        
-        # 4. Cohen's d (Effect Size)
-        # pooled std
-        pooled_std = np.sqrt(((n1-1)*v1 + (n2-1)*v2) / (n1+n2-2))
-        cohens_d = (np.mean(data1) - np.mean(data2)) / pooled_std if pooled_std != 0 else 0
+            data1 = pd.to_numeric(data1, errors='coerce').dropna().values
+            data2 = pd.to_numeric(data2, errors='coerce').dropna().values
+            
+            n1, n2 = len(data1), len(data2)
+            if n1 < 2 or n2 < 2:
+                continue # Yetersiz veri olan değişkeni atla
+                
+            m1, m2 = float(np.mean(data1)), float(np.mean(data2))
+            std1, std2 = float(np.std(data1, ddof=1)), float(np.std(data2, ddof=1))
+            
+            # Levene Test (Homojenlik)
+            try:
+                stat_lev, p_lev = stats.levene(data1, data2, center='mean')
+            except:
+                p_lev = 1.0 # Varsayılan olarak eşit kabul et
+                
+            is_equal_var = p_lev >= 0.05
+            
+            # T-Test Seçimi
+            t_stat, p_val = stats.ttest_ind(data1, data2, equal_var=is_equal_var)
+            
+            # Cohen's d
+            v1, v2 = np.var(data1, ddof=1), np.var(data2, ddof=1)
+            pooled_std = np.sqrt(((n1-1)*v1 + (n2-1)*v2) / (n1+n2-2))
+            cohens_d = abs(m1 - m2) / pooled_std if pooled_std != 0 else 0
+            
+            results.append({
+                "varName": var,
+                "is_equal_var": bool(is_equal_var),
+                "levene_p": float(p_lev) if p_lev else None,
+                "t": float(t_stat),
+                "p": float(p_val),
+                "cohens_d": float(cohens_d),
+                "g1": {"val": str(g1_val), "n": n1, "mean": m1, "std": std1},
+                "g2": {"val": str(g2_val), "n": n2, "mean": m2, "std": std2}
+            })
 
         return {
-            "depVar": req.depVar,
             "groupVar": req.groupVar,
-            "descriptives": desc,
-            "assumptions": {
-                "shapiro": {"g1": {"W": stat_s1, "p": p_s1}, "g2": {"W": stat_s2, "p": p_s2}},
-                "levene": {"F": stat_lev, "p": p_lev}
-            },
-            "ttest": {
-                "equal_var": {"t": float(t_eq), "df": float(df_eq), "p": float(p_eq)},
-                "unequal_var": {"t": float(t_uneq), "df": float(df_uneq), "p": float(p_uneq)}
-            },
-            "cohens_d": float(abs(cohens_d))
+            "originalGroups": [str(g1_val), str(g2_val)],
+            "results": results
         }
     except Exception as e:
         return {"error": str(e)}
