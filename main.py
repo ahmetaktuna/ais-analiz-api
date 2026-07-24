@@ -284,11 +284,12 @@ def normality(req: NormalityRequest):
             skew = float(stats.skew(data, bias=False))
             kurt = float(stats.kurtosis(data, bias=False))
             
-            # SciPy "ndtr" argüman hatasını önlemek için veri matematiksel olarak standardize edilir (Z-Score)
+            # SciPy "ndtr" argüman hatasını tamamen önlemek için Z-Skoru ve Özel CDF kullanımı
             z_data = (data - mean) / std 
             
-            # Artık args=(mean, std) parametresi göndermemize gerek kalmadan standart normal dağılımla sınanır
-            ks_stat, ks_p = stats.kstest(z_data, 'norm')
+            # Kütüphane çakışmalarını önlemek için dağılım fonksiyonunu izole ediyoruz
+            custom_cdf = lambda x: stats.norm.cdf(x)
+            ks_stat, ks_p = stats.kstest(z_data, custom_cdf)
             
             results.append({
                 "varName": var,
