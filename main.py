@@ -243,3 +243,48 @@ def anova_multiple(req: MultipleANOVARequest):
         }
     except Exception as e:
         return {"error": str(e)}
+class NormalityRequest(BaseModel):
+    depVars: List[str]
+    data: List[Dict[str, Any]]
+
+@app.post("/normality")
+def normality(req: NormalityRequest):
+    try:
+        df = pd.DataFrame(req.data)
+        results = []
+        
+        for var in req.depVars:
+            data = pd.to_numeric(df[var], errors='coerce').dropna().values
+            n = len(data)
+            if n < 3: continue
+            
+            mean = float(np.mean(data))
+            median = float(np.median(data))
+            
+            # Mod (Tepe Değer) hesaplama
+            vals, counts = np.unique(data, return_counts=True)
+            mode = float(vals[np.argmax(counts)])
+            
+            std = float(np.std(data, ddof=1))
+            skew = float(stats.skew(data, bias=False)) # Örneklem çarpıklığı
+            kurt = float(stats.kurtosis(data, bias=False)) # Örneklem basıklığı
+            
+            # Kolmogorov-Smirnov Normallik Testi
+            ks_stat, ks_p = stats.kstest(data, 'norm', args=(mean, std))
+            
+            results.append({
+                "varName": var,
+                "n": n,
+                "mean": mean,
+                "median": median,
+                "mode": mode,
+                "std": std,
+                "skewness": skew,
+                "kurtosis": kurt,
+                "ks_stat": float(ks_stat),
+                "ks_p": float(ks_p)
+            })
+            
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
