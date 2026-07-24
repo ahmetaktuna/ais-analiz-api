@@ -21,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- VERİ MODELLERİ ---
 class AnalysisRequest(BaseModel):
     depVar: str
     indepVars: List[str]
@@ -46,7 +45,6 @@ class NormalityRequest(BaseModel):
 def ping():
     return {"status": "Uyanığım ve analize hazırım!"}
 
-# --- 1. REGRESYON ANALİZİ ---
 @app.post("/analyze")
 def analyze(req: AnalysisRequest):
     try:
@@ -114,7 +112,6 @@ def analyze(req: AnalysisRequest):
     except Exception as e:
         return {"error": f"Regresyon Hatası: {str(e)}"}
 
-# --- 2. T-TESTİ ---
 @app.post("/ttest-multiple")
 def ttest_multiple(req: MultipleTTestRequest):
     try:
@@ -179,7 +176,6 @@ def ttest_multiple(req: MultipleTTestRequest):
     except Exception as e:
         return {"error": f"T-Testi Hatası: {str(e)}"}
 
-# --- 3. ANOVA ---
 @app.post("/anova-multiple")
 def anova_multiple(req: MultipleANOVARequest):
     try:
@@ -259,7 +255,6 @@ def anova_multiple(req: MultipleANOVARequest):
     except Exception as e:
         return {"error": f"ANOVA Hatası: {str(e)}"}
 
-# --- 4. NORMALLİK SINAMASI ---
 @app.post("/normality")
 def normality(req: NormalityRequest):
     try:
@@ -279,7 +274,6 @@ def normality(req: NormalityRequest):
             
             std = float(np.std(data, ddof=1)) if n > 1 else 0.0
             
-            # Eğer tüm cevaplar aynıysa (Standart sapma 0 ise) sistemin çökmemesi için:
             if std == 0:
                 results.append({
                     "varName": var, "n": n, "mean": mean, "median": median, "mode": mode,
@@ -287,12 +281,14 @@ def normality(req: NormalityRequest):
                 })
                 continue
             
-            # Çarpıklık ve Basıklık
             skew = float(stats.skew(data, bias=False))
             kurt = float(stats.kurtosis(data, bias=False))
             
-            # Kolmogorov-Smirnov
-            ks_stat, ks_p = stats.kstest(data, 'norm', args=(mean, std))
+            # SciPy "ndtr" argüman hatasını önlemek için veri matematiksel olarak standardize edilir (Z-Score)
+            z_data = (data - mean) / std 
+            
+            # Artık args=(mean, std) parametresi göndermemize gerek kalmadan standart normal dağılımla sınanır
+            ks_stat, ks_p = stats.kstest(z_data, 'norm')
             
             results.append({
                 "varName": var,
