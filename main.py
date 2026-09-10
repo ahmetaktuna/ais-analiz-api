@@ -24,6 +24,8 @@ app.add_middleware(
 # === PANEL VERI ANALIZI MODULU ===
 from panel_api import router as panel_router
 app.include_router(panel_router)
+from ts_api import router as ts_router
+app.include_router(ts_router)
 # =================================
 
 class AnalysisRequest(BaseModel):
