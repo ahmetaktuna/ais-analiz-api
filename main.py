@@ -21,6 +21,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# === PANEL VERI ANALIZI MODULU ===
+from panel_api import router as panel_router
+app.include_router(panel_router)
+# =================================
+
 class AnalysisRequest(BaseModel):
     depVar: str
     indepVars: List[str]
