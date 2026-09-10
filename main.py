@@ -7,6 +7,10 @@ Uc noktalar:
     POST /ttest-multiple   -> bagimsiz orneklem t-testi (coklu degisken)
     POST /anova-multiple   -> tek yonlu ANOVA + post-hoc (coklu degisken)
     POST /normality        -> normallik sinamasi ve betimsel istatistikler
+    POST /mannwhitney-multiple  -> Mann-Whitney U (t-testinin non-parametrik karsiligi)
+    POST /kruskal-multiple      -> Kruskal-Wallis H + Dunn (ANOVA'nin karsiligi)
+    POST /pairedttest-multiple  -> bagimli (eslestirilmis) orneklem t-testi
+    POST /wilcoxon-multiple     -> Wilcoxon isaretli siralar (bagimli t'nin karsiligi)
 
 Panel veri ve zaman serisi modulleri ayri router'lar olarak eklenir.
 
@@ -916,6 +920,220 @@ def kruskal_multiple(req: MultipleANOVARequest):
     except Exception as e:
         log.exception("kruskal failed")
         return {"error": f"Kruskal-Wallis Testi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# ==========================================================================
+# ESLESTIRILMIS (BAGIMLI) ORNEKLEM TESTLERI
+# --------------------------------------------------------------------------
+# Ayni kisilerden iki kez olcum alindiginda (ontest-sontest, oncesi-sonrasi)
+# kullanilir:
+#   Parametrik      : Bagimli Orneklem t-Testi
+#   Non-parametrik  : Wilcoxon Isaretli Siralar Testi
+#
+# Fark her iki testte de d = (2. olcum) - (1. olcum) olarak hesaplanir; boylece
+# pozitif deger "ikinci olcum daha yuksek" anlamina gelir ve iki testin yonu
+# birbiriyle tutarli kalir. Bu, raporlarda acikca belirtilir.
+# ==========================================================================
+
+class PairedRequest(BaseModel):
+    pairs: List[Dict[str, Any]]        # [{"a": "Ontest", "b": "Sontest", "label": "..."}]
+    data: List[Dict[str, Any]]
+
+
+def _pair_cols(pairs) -> List[str]:
+    out = []
+    for p in pairs or []:
+        for k in ("a", "b"):
+            v = p.get(k)
+            if isinstance(v, str) and v and v not in out:
+                out.append(v)
+    return out
+
+
+def _pair_prep(df, p):
+    """Bir cift icin eslesmis (listwise) gozlemleri dondurur."""
+    a, b = p.get("a"), p.get("b")
+    if not a or not b or a == b:
+        return None
+    if a not in df.columns or b not in df.columns:
+        return None
+    x = pd.to_numeric(df[a], errors="coerce")
+    y = pd.to_numeric(df[b], errors="coerce")
+    ok = x.notna() & y.notna()          # eslesmis veri: iki olcum de dolu olmali
+    xa = x[ok].to_numpy(dtype=float)
+    yb = y[ok].to_numpy(dtype=float)
+    if xa.size < 3:
+        return None
+    etiket = p.get("label") or f"{a} - {b}"
+    return a, b, xa, yb, str(etiket)
+
+
+# --------------------------------------------------------------------------
+# Bagimli orneklem t-testi
+# --------------------------------------------------------------------------
+
+@app.post("/pairedttest-multiple")
+def paired_ttest_multiple(req: PairedRequest):
+    try:
+        cols = _pair_cols(req.pairs)
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        if not cols:
+            return {"error": "Karşılaştırılacak ölçüm çifti belirtilmedi."}
+        df = _frame(req.data, cols)
+        bad = _missing(df, cols)
+        if bad:
+            return bad
+
+        results, skipped = [], []
+        for p in req.pairs:
+            hazir = _pair_prep(df, p)
+            if hazir is None:
+                skipped.append(p.get("label") or f"{p.get('a')} - {p.get('b')}")
+                continue
+            a, b, xa, yb, etiket = hazir
+            n = int(xa.size)
+            d = yb - xa                        # 2. olcum - 1. olcum
+            ort_d = float(d.mean())
+            sd_d = float(d.std(ddof=1)) if n > 1 else 0.0
+            se_d = sd_d / math.sqrt(n) if n > 0 and sd_d > 0 else 0.0
+
+            try:
+                tt = stats.ttest_rel(yb, xa)
+                t_stat, p_val = _f(tt.statistic), _f(tt.pvalue, 1.0)
+            except Exception:
+                t_stat, p_val = 0.0, 1.0
+            dfree = n - 1
+
+            # olcumler arasi korelasyon (SPSS de raporlar)
+            try:
+                if xa.std() > 0 and yb.std() > 0:
+                    pr = stats.pearsonr(xa, yb)
+                    r_corr, r_p = _f(pr.statistic), _f(pr.pvalue, 1.0)
+                else:
+                    r_corr, r_p = 0.0, 1.0
+            except Exception:
+                r_corr, r_p = 0.0, 1.0
+
+            # etki buyuklugu: Cohen's d_z (farklarin standart sapmasi uzerinden)
+            dz = ort_d / sd_d if sd_d > 0 else 0.0
+            # ortalama standart sapma uzerinden d_av (bazi kaynaklar bunu ister)
+            sd_ort = (float(xa.std(ddof=1)) + float(yb.std(ddof=1))) / 2.0 if n > 1 else 0.0
+            dav = ort_d / sd_ort if sd_ort > 0 else 0.0
+
+            tcrit = float(stats.t.ppf(0.975, dfree)) if dfree > 0 else 0.0
+            results.append({
+                "label": etiket, "a": a, "b": b, "n": n,
+                "aMean": _f(xa.mean()), "aStd": _f(xa.std(ddof=1)) if n > 1 else 0.0,
+                "bMean": _f(yb.mean()), "bStd": _f(yb.std(ddof=1)) if n > 1 else 0.0,
+                "meanDiff": _f(ort_d), "sdDiff": _f(sd_d), "seDiff": _f(se_d),
+                "ciLow": _f(ort_d - tcrit * se_d), "ciHigh": _f(ort_d + tcrit * se_d),
+                "t": t_stat, "df": int(dfree), "p": p_val,
+                "cohens_d": _f(dz), "cohens_dav": _f(dav),
+                "corr": r_corr, "corrP": r_p,
+            })
+
+        return {"test": "Bağımlı Örneklem t-Testi", "results": results, "skipped": skipped}
+    except Exception as e:
+        log.exception("paired ttest failed")
+        return {"error": f"Bağımlı Örneklem t-Testi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# --------------------------------------------------------------------------
+# Wilcoxon isaretli siralar testi
+# --------------------------------------------------------------------------
+
+@app.post("/wilcoxon-multiple")
+def wilcoxon_multiple(req: PairedRequest):
+    try:
+        cols = _pair_cols(req.pairs)
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        if not cols:
+            return {"error": "Karşılaştırılacak ölçüm çifti belirtilmedi."}
+        df = _frame(req.data, cols)
+        bad = _missing(df, cols)
+        if bad:
+            return bad
+
+        results, skipped = [], []
+        for p in req.pairs:
+            hazir = _pair_prep(df, p)
+            if hazir is None:
+                skipped.append(p.get("label") or f"{p.get('a')} - {p.get('b')}")
+                continue
+            a, b, xa, yb, etiket = hazir
+            n_toplam = int(xa.size)
+            d = yb - xa                        # 2. olcum - 1. olcum
+
+            esit = int((d == 0).sum())         # Wilcoxon'da sifir farklar atilir
+            dn = d[d != 0]
+            n = int(dn.size)
+            if n < 3:
+                skipped.append(etiket)
+                continue
+
+            mutlak = np.abs(dn)
+            r, tie_sum = _ranks_with_ties(mutlak)
+            poz = r[dn > 0]
+            neg = r[dn < 0]
+            W_poz = float(poz.sum())
+            W_neg = float(neg.sum())
+            T = min(W_poz, W_neg)
+
+            # baglanma duzeltmeli varyans ve surekli duzeltmeli z
+            mu = n * (n + 1) / 4.0
+            var_t = (n * (n + 1) * (2 * n + 1)) / 24.0 - tie_sum / 48.0
+            sd_t = math.sqrt(var_t) if var_t > 0 else 0.0
+            if sd_t > 0:
+                fark = W_poz - mu
+                duz = math.copysign(0.5, fark) if fark != 0 else 0.0
+                z = (fark - duz) / sd_t
+            else:
+                z = 0.0
+
+            try:
+                tam = (tie_sum == 0 and esit == 0 and n <= 25)
+                wt = stats.wilcoxon(yb, xa, alternative="two-sided",
+                                    zero_method="wilcox",
+                                    method=("exact" if tam else "approx"))
+                p_val = _f(wt.pvalue, 1.0)
+                yontem = ("Tam (exact) dağılım" if tam
+                          else "Normal yaklaşım (bağlanma düzeltmeli)")
+            except Exception:
+                p_val = _f(2.0 * stats.norm.sf(abs(z)), 1.0)
+                yontem = "Normal yaklaşım (bağlanma düzeltmeli)"
+
+            results.append({
+                "label": etiket, "a": a, "b": b,
+                "n": n_toplam, "nUsed": n,
+                "aMean": _f(xa.mean()), "aStd": _f(xa.std(ddof=1)) if n_toplam > 1 else 0.0,
+                "aMedian": _f(np.median(xa)),
+                "bMean": _f(yb.mean()), "bStd": _f(yb.std(ddof=1)) if n_toplam > 1 else 0.0,
+                "bMedian": _f(np.median(yb)),
+                "neg": {"n": int(neg.size),
+                        "meanRank": _f(neg.mean()) if neg.size else 0.0,
+                        "sumRank": _f(W_neg)},
+                "pos": {"n": int(poz.size),
+                        "meanRank": _f(poz.mean()) if poz.size else 0.0,
+                        "sumRank": _f(W_poz)},
+                "esit": esit,
+                "T": _f(T), "z": _f(z), "p": p_val,
+                "r": _f(abs(z) / math.sqrt(n_toplam)) if n_toplam > 0 else 0.0,
+                "medianDiff": _f(np.median(d)),
+                "ties": tie_sum > 0, "method": yontem,
+            })
+
+        return {"test": "Wilcoxon İşaretli Sıralar", "results": results, "skipped": skipped}
+    except Exception as e:
+        log.exception("wilcoxon failed")
+        return {"error": f"Wilcoxon İşaretli Sıralar Testi Hatası: {e}"}
     finally:
         gc.collect()
 
