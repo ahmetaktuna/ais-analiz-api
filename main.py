@@ -673,6 +673,254 @@ def anova_multiple(req: MultipleANOVARequest):
 
 
 # ==========================================================================
+# NON-PARAMETRIK TESTLER
+# --------------------------------------------------------------------------
+# Bagimsiz orneklem t-testinin karsiligi : Mann-Whitney U
+# Tek yonlu ANOVA'nin karsiligi          : Kruskal-Wallis H (+ Dunn post-hoc)
+#
+# Her ikisi de baglanmis siralar (ties) icin duzeltme icerir; bu duzeltme
+# yapilmazsa baglanma cok olan olcek verilerinde p degeri oldugundan buyuk
+# cikar (testi muhafazakar yapar).
+# ==========================================================================
+
+def _ranks_with_ties(x: np.ndarray):
+    """Ortalama siralar ve baglanma duzeltme terimi Sum(t^3 - t)."""
+    r = stats.rankdata(x)                      # baglanmalarda ortalama sira
+    _, counts = np.unique(x, return_counts=True)
+    tie_sum = float(((counts ** 3) - counts).sum())
+    return r, tie_sum
+
+
+def _grup_ozeti(vals: np.ndarray, ranks: np.ndarray, label) -> dict:
+    n = int(vals.size)
+    return {
+        "val": str(label), "n": n,
+        "mean": _f(vals.mean()) if n else 0.0,
+        "std": _f(vals.std(ddof=1)) if n > 1 else 0.0,
+        "median": _f(np.median(vals)) if n else 0.0,
+        "meanRank": _f(ranks.mean()) if n else 0.0,
+        "sumRank": _f(ranks.sum()) if n else 0.0,
+    }
+
+
+# --------------------------------------------------------------------------
+# Mann-Whitney U
+# --------------------------------------------------------------------------
+
+@app.post("/mannwhitney-multiple")
+def mannwhitney_multiple(req: MultipleTTestRequest):
+    try:
+        cols = [req.groupVar] + list(req.depVars)
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        df = _frame(req.data, cols)
+        bad = _missing(df, [req.groupVar])
+        if bad:
+            return bad
+        df = df.dropna(subset=[req.groupVar])
+
+        groups = _sorted_levels(df[req.groupVar])
+        if len(groups) != 2:
+            return {"error": f"Mann-Whitney U testi için grup değişkeninizde tam olarak "
+                             f"2 kategori olmalıdır. Sizde {len(groups)} bulundu."}
+        g1_val, g2_val = groups[0], groups[1]
+        m1 = df[req.groupVar] == g1_val
+        m2 = df[req.groupVar] == g2_val
+
+        results, skipped = [], []
+        for var in req.depVars:
+            if var not in df.columns or var == req.groupVar:
+                skipped.append(var)
+                continue
+            col = pd.to_numeric(df[var], errors="coerce")
+            d1 = col[m1].dropna().to_numpy(dtype=float)
+            d2 = col[m2].dropna().to_numpy(dtype=float)
+            n1, n2 = d1.size, d2.size
+            if n1 < 2 or n2 < 2:
+                skipped.append(var)
+                continue
+
+            hepsi = np.concatenate([d1, d2])
+            N = n1 + n2
+            r, tie_sum = _ranks_with_ties(hepsi)
+            r1, r2 = r[:n1], r[n1:]
+
+            R1 = float(r1.sum())
+            U1 = R1 - n1 * (n1 + 1) / 2.0
+            U2 = n1 * n2 - U1
+            U = min(U1, U2)
+
+            # baglanma duzeltmeli standart sapma ve surekli duzeltmeli z
+            mu = n1 * n2 / 2.0
+            var_u = (n1 * n2 / 12.0) * ((N + 1) - tie_sum / (N * (N - 1.0))) \
+                if N > 1 else 0.0
+            sd_u = math.sqrt(var_u) if var_u > 0 else 0.0
+            if sd_u > 0:
+                fark = U1 - mu
+                duz = math.copysign(0.5, fark) if fark != 0 else 0.0
+                z = (fark - duz) / sd_u
+            else:
+                z = 0.0
+
+            # p degeri: baglanma yoksa ve orneklem kucukse tam (exact) dagilim
+            try:
+                mw = stats.mannwhitneyu(
+                    d1, d2, alternative="two-sided",
+                    method=("exact" if (tie_sum == 0 and n1 <= 20 and n2 <= 20)
+                            else "asymptotic"))
+                p = _f(mw.pvalue, 1.0)
+                yontem = ("Tam (exact) dağılım" if (tie_sum == 0 and n1 <= 20 and n2 <= 20)
+                          else "Normal yaklaşım (bağlanma düzeltmeli)")
+            except Exception:
+                p = _f(2.0 * stats.norm.sf(abs(z)), 1.0)
+                yontem = "Normal yaklaşım (bağlanma düzeltmeli)"
+
+            results.append({
+                "varName": var,
+                "U": _f(U), "U1": _f(U1), "U2": _f(U2),
+                "W": _f(R1),                       # birinci grubun sıra toplamı
+                "z": _f(z), "p": p,
+                "r": _f(abs(z) / math.sqrt(N)) if N > 0 else 0.0,   # etki büyüklüğü
+                "n": int(N), "ties": tie_sum > 0, "method": yontem,
+                "g1": _grup_ozeti(d1, r1, g1_val),
+                "g2": _grup_ozeti(d2, r2, g2_val),
+            })
+
+        return {"groupVar": req.groupVar, "test": "Mann-Whitney U",
+                "originalGroups": [str(g1_val), str(g2_val)],
+                "results": results, "skipped": skipped}
+    except Exception as e:
+        log.exception("mannwhitney failed")
+        return {"error": f"Mann-Whitney U Testi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# --------------------------------------------------------------------------
+# Kruskal-Wallis H + Dunn post-hoc
+# --------------------------------------------------------------------------
+
+def _dunn(gruplar, labels, ranks_by_group, N, tie_sum):
+    """Dunn (1964) ikili karsilastirmalari, Bonferroni duzeltmeli."""
+    k = len(gruplar)
+    pairs = list(itertools.combinations(range(k), 2))
+    ncomp = len(pairs)
+    # ortak standart hata terimi
+    taban = (N * (N + 1) / 12.0) - (tie_sum / (12.0 * (N - 1.0))) if N > 1 else 0.0
+    out, detay = [], []
+    for i, j in pairs:
+        ni, nj = gruplar[i].size, gruplar[j].size
+        if ni < 1 or nj < 1:
+            continue
+        ri = float(ranks_by_group[i].mean())
+        rj = float(ranks_by_group[j].mean())
+        se = math.sqrt(taban * (1.0 / ni + 1.0 / nj)) if taban > 0 else 0.0
+        if se <= 0:
+            continue
+        z = (ri - rj) / se
+        p_raw = 2.0 * float(stats.norm.sf(abs(z)))
+        p_adj = min(1.0, p_raw * ncomp)
+        sig = p_adj < 0.05
+        hi, lo = (i, j) if ri > rj else (j, i)
+        detay.append({"a": str(labels[i]), "b": str(labels[j]),
+                      "meanRankDiff": _f(ri - rj), "se": _f(se),
+                      "stat": _f(z), "statName": "z",
+                      "pRaw": _f(p_raw, 1.0), "p": _f(p_adj, 1.0), "sig": bool(sig)})
+        if sig:
+            out.append({"higher": str(labels[hi]), "lower": str(labels[lo])})
+    return out, detay
+
+
+@app.post("/kruskal-multiple")
+def kruskal_multiple(req: MultipleANOVARequest):
+    try:
+        cols = [req.groupVar] + list(req.depVars)
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        df = _frame(req.data, cols)
+        bad = _missing(df, [req.groupVar])
+        if bad:
+            return bad
+        df = df.dropna(subset=[req.groupVar])
+
+        levels = _sorted_levels(df[req.groupVar])
+        if len(levels) < 2:
+            return {"error": f"Kruskal-Wallis testi için grup değişkeninizde en az 2, "
+                             f"tercihen 3 kategori olmalıdır. Sizde {len(levels)} bulundu."}
+        masks = [(df[req.groupVar] == g) for g in levels]
+
+        results, skipped = [], []
+        for var in req.depVars:
+            if var not in df.columns or var == req.groupVar:
+                skipped.append(var)
+                continue
+            col = pd.to_numeric(df[var], errors="coerce")
+            gdata = [col[mk].dropna().to_numpy(dtype=float) for mk in masks]
+            kullanilabilir = [(g, lab) for g, lab in zip(gdata, levels) if g.size >= 2]
+            if len(kullanilabilir) < 2:
+                skipped.append(var)
+                continue
+            gd = [g for g, _ in kullanilabilir]
+            lb = [lab for _, lab in kullanilabilir]
+
+            hepsi = np.concatenate(gd)
+            N = int(hepsi.size)
+            r, tie_sum = _ranks_with_ties(hepsi)
+            # her grubun siralarini ayir
+            ranks_by_group, bas = [], 0
+            for g in gd:
+                ranks_by_group.append(r[bas:bas + g.size])
+                bas += g.size
+
+            try:
+                kw = stats.kruskal(*gd)
+                H, p = _f(kw.statistic), _f(kw.pvalue, 1.0)
+            except Exception:
+                H, p = 0.0, 1.0
+            k = len(gd)
+            dfree = k - 1
+
+            gstats = [_grup_ozeti(g, rk, lab)
+                      for g, rk, lab in zip(gd, ranks_by_group, lb)]
+            # analiz disi kalan gruplar da tabloda gorunsun
+            for g, lab in zip(gdata, levels):
+                if lab not in lb:
+                    gstats.append({"val": str(lab), "n": int(g.size),
+                                   "mean": _f(g.mean()) if g.size else 0.0,
+                                   "std": _f(g.std(ddof=1)) if g.size > 1 else 0.0,
+                                   "median": _f(np.median(g)) if g.size else 0.0,
+                                   "meanRank": None, "sumRank": None})
+
+            # etki buyuklukleri
+            eps2 = _f(H / (N - 1.0)) if N > 1 else 0.0
+            eta2 = _f((H - k + 1) / (N - k)) if N > k else 0.0
+
+            pairs, detay = ([], [])
+            if p < 0.05 and k >= 2:
+                pairs, detay = _dunn(gd, lb, ranks_by_group, N, tie_sum)
+
+            results.append({
+                "varName": var, "H": H, "df": int(dfree), "p": p, "n": N,
+                "epsilon2": eps2, "eta2H": eta2, "ties": tie_sum > 0,
+                "groups": gstats, "postHocPairs": pairs, "postHocDetail": detay,
+                "total": {"n": N, "mean": _f(hepsi.mean()),
+                          "std": _f(hepsi.std(ddof=1)) if N > 1 else 0.0,
+                          "median": _f(np.median(hepsi))},
+            })
+
+        return {"groupVar": req.groupVar, "test": "Kruskal-Wallis H",
+                "postHoc": "Dunn", "originalGroups": [str(g) for g in levels],
+                "results": results, "skipped": skipped}
+    except Exception as e:
+        log.exception("kruskal failed")
+        return {"error": f"Kruskal-Wallis Testi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# ==========================================================================
 # NORMALLIK SINAMASI
 # ==========================================================================
 
