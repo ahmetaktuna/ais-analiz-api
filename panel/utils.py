@@ -1,8 +1,91 @@
 """Ortak matematiksel yardimcilar."""
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
+
 import numpy as np
 from scipy import stats
+
+# --------------------------------------------------------------------------
+# Monte Carlo zaman butcesi ve birikimli onbellek
+# --------------------------------------------------------------------------
+# LLC, IPS, Pedroni ve Westerlund testlerinin p-degerleri simulasyonla
+# uretilir. Buyuk panellerde (N=60, T=25, 800 tekrar) bu tek basina 50
+# saniyeyi asabiliyor ve Render'in istek zaman sinirini zorluyordu.
+#
+# Cozum: cekilisler bir zaman butcesi icinde yapilir ve TAMAMLANAN
+# cekilisler onbellekte BIRIKTIRILIR. Butce dolarsa o istek elindeki
+# cekilislerle p-degerini uretir ve rapora "tekrar sayisi dusuruldu" notu
+# duser; bir sonraki istek kaldigi yerden devam ederek dagilimi zenginlestirir.
+# Her parca kendi tohumuyla uretildigi icin sonuclar yeniden uretilebilirdir.
+
+_MC_CACHE: "OrderedDict[tuple, list]" = OrderedDict()
+_MC_CACHE_MAX = 192
+_BUDGET = {"deadline": None, "truncated": False}
+
+
+def set_time_budget(seconds):
+    """Bu istek icin simulasyon butcesini baslatir (None = sinirsiz)."""
+    _BUDGET["deadline"] = (time.time() + float(seconds)) if seconds else None
+    _BUDGET["truncated"] = False
+
+
+def budget_left():
+    d = _BUDGET["deadline"]
+    return None if d is None else d - time.time()
+
+
+def budget_truncated() -> bool:
+    """Bu istekte herhangi bir simulasyon butce nedeniyle kesildi mi?"""
+    return bool(_BUDGET["truncated"])
+
+
+MC_BLOCK = 10          # cekilisler bu boyutta SABIT bloklar halinde uretilir
+
+
+def mc_draws(key, reps, base_seed, draw):
+    """`reps` adet bagimsiz cekilis uretir; sonuclari birikimli saklar.
+
+    Cekilisler MC_BLOCK boyutunda sabit bloklara ayrilir ve b numarali blok
+    her zaman `base_seed + b` tohumuyla uretilir. Boylece butce nereden
+    keserse kessin i numarali cekilis hep ayni degerdir: sonuclar yeniden
+    uretilebilir kalir. Butce yalnizca KAC blok uretildigini belirler.
+
+    draw(rng) -> tek bir cekilis (float ya da dict).
+    Donen: (liste, kesildi_mi)
+    """
+    reps = int(reps)
+    vals = _MC_CACHE.get(key)
+    if vals is None:
+        vals = []
+    else:
+        _MC_CACHE.move_to_end(key)
+    if len(vals) >= reps:
+        return vals[:reps], False
+
+    # her zaman tam blok sinirindan devam et
+    done_blocks = len(vals) // MC_BLOCK
+    del vals[done_blocks * MC_BLOCK:]
+    need_blocks = -(-reps // MC_BLOCK)          # yukari yuvarla
+
+    truncated = False
+    for b in range(done_blocks, need_blocks):
+        left = budget_left()
+        if left is not None and left <= 0:
+            truncated = True
+            break
+        rng = np.random.default_rng(base_seed + b)   # blok basina sabit tohum
+        for _ in range(MC_BLOCK):
+            vals.append(draw(rng))
+
+    _MC_CACHE[key] = vals
+    _MC_CACHE.move_to_end(key)
+    while len(_MC_CACHE) > _MC_CACHE_MAX:
+        _MC_CACHE.popitem(last=False)
+    if truncated:
+        _BUDGET["truncated"] = True
+    return vals[:reps], truncated
 
 # --------------------------------------------------------------------------
 # Temel EKK

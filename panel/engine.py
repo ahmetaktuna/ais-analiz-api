@@ -9,7 +9,7 @@ import pandas as pd
 
 from . import causality, coint, diagnostics, dynamic, models, unitroot
 from .prepare import MAX_ROWS, MAX_UNITS, Panel, correlation, descriptives, detect_structure
-from .utils import f, safe
+from .utils import budget_truncated, f, mc_draws, safe, set_time_budget
 
 ENGINE = {
     "name": "AIS Akademi Panel Veri Analizi Motoru",
@@ -103,6 +103,11 @@ def analyze(payload: dict) -> dict:
     mods.update(payload.get("modules") or {})
     opts = payload.get("options") or {}
     mc = MC_PRESETS.get(str(opts.get("precision", "standard")), 300)
+    # Monte Carlo simulasyonlari icin istek basina zaman butcesi. Butce
+    # dolarsa test atlanmaz; o ana kadar uretilen cekilislerle p-degeri
+    # hesaplanir ve rapora not duselir. Cekilisler onbellekte biriktigi icin
+    # sonraki istek kaldigi yerden devam eder.
+    set_time_budget(opts.get("mcTimeBudget", 45))
 
     res = {
         "ok": True,
@@ -134,27 +139,37 @@ def analyze(payload: dict) -> dict:
             res["errors"]["descriptives"] = str(exc)
 
     # ---------------- Temel modeller ----------------
+    # Tanilayici testler SE ve FE artiklarina ihtiyac duyar. Adim adim
+    # calistirmada kullanici yalnizca tanilayici modulu secmis olabilir;
+    # bu durumda modeller icerde tahmin edilir ama "basic" bolumu
+    # raporlanmaz. (Onceki surumde bu durumda tanilayici testler sessizce
+    # hic calismiyordu.)
+    want_basic = bool(mods.get("basic", True))
+    want_diag = bool(mods.get("diagnostics", True))
     fit_objs = None
-    if mods.get("basic", True):
+    if want_basic or want_diag:
         try:
             effects = opts.get("effects", "entity")
             cov = opts.get("covType", "clustered")
             basic, fit_objs = models.fit_all(pnl, effects=effects, cov_type=cov)
-            res["basic"] = basic
-            if opts.get("robustComparison", True):
-                res["basic"]["seComparison"] = models.robust_variants(pnl, effects)
+            if want_basic:
+                res["basic"] = basic
+                if opts.get("robustComparison", True):
+                    res["basic"]["seComparison"] = models.robust_variants(pnl, effects)
         except Exception as exc:
-            res["errors"]["basic"] = str(exc)
-            res["errors"]["basicTrace"] = traceback.format_exc(limit=3)
+            key = "basic" if want_basic else "diagnostics"
+            res["errors"][key] = str(exc)
+            res["errors"][key + "Trace"] = traceback.format_exc(limit=3)
 
     # ---------------- Tanilayici testler ----------------
-    if mods.get("diagnostics", True) and fit_objs:
+    if want_diag and fit_objs:
         try:
             fe_r = np.asarray(fit_objs["fe"].resids.values, float).ravel()
             po_r = np.asarray(fit_objs["pooled"].resids.values, float).ravel()
             res["diagnostics"] = diagnostics.run_all(pnl, fe_r, po_r)
         except Exception as exc:
             res["errors"]["diagnostics"] = str(exc)
+    fit_objs = None                      # linearmodels nesnelerini serbest birak
 
     # ---------------- Panel birim kok ----------------
     if mods.get("unitroot"):
@@ -209,6 +224,14 @@ def analyze(payload: dict) -> dict:
                 p=int(opts.get("ardlP", 1)), q=int(opts.get("ardlQ", 1)))
         except Exception as exc:
             res["errors"]["dynamic"] = str(exc)
+
+    if budget_truncated():
+        res["warnings"].append(
+            "Simülasyon süre sınırına ulaşıldığı için Monte Carlo tabanlı "
+            "testlerde (LLC, IPS, Pedroni, Westerlund) tekrar sayısı "
+            "düşürülmüştür; bu testlerin p-değerleri biraz daha az hassastır. "
+            "Analizi yeniden çalıştırırsanız simülasyon kaldığı yerden "
+            "sürdürülerek hassasiyet artar.")
 
     _availability_notes(res, pnl, mods)
     res["narrative"] = build_narrative(res, pnl)

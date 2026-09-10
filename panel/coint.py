@@ -2,13 +2,13 @@
 uzun donem katsayi tahmincileri (Grup-ortalamasi FMOLS ve DOLS)."""
 from __future__ import annotations
 
-from functools import lru_cache
 
 import numpy as np
 from scipy import stats
 
 from .prepare import Panel
-from .utils import add_const, f, newey_west_lrcov, newey_west_lrv, ols, star
+from .utils import (add_const, f, mc_draws, newey_west_lrcov,
+                    newey_west_lrv, ols, star)
 
 
 def _nw_lags(T):
@@ -158,20 +158,20 @@ PEDRONI_META = [
 ]
 
 
-@lru_cache(maxsize=64)
 def _pedroni_null(N: int, T: int, k: int, det: str, lags: int, reps: int,
                   seed: int = 90210):
-    rng = np.random.default_rng(seed + 13 * N + 7 * T + 3 * k + lags + len(det))
-    acc = {key: [] for key, *_ in PEDRONI_META}
-    for _ in range(reps):
+    def draw(rng):
         units = []
         for _i in range(N):
             y = np.cumsum(rng.standard_normal(T))
             X = np.cumsum(rng.standard_normal((T, k)), axis=0)
             units.append((y, X))
-        r = _pedroni_raw(units, det, lags)
-        if not r:
-            continue
+        return _pedroni_raw(units, det, lags) or {}
+
+    rows, _ = mc_draws(("pedroni", N, T, k, det, lags), reps,
+                       seed + 13 * N + 7 * T + 3 * k + lags + len(det), draw)
+    acc = {key: [] for key, *_ in PEDRONI_META}
+    for r in rows:
         for key, *_ in PEDRONI_META:
             v = r.get(key)
             if v is not None and np.isfinite(v):
@@ -218,7 +218,9 @@ def pedroni(pnl: Panel, det="c", lags=1, reps=200):
     return {
         "name": "Pedroni (1999, 2004) Panel Eşbütünleşme Testi",
         "h0": "Eşbütünleşme ilişkisi yoktur",
-        "det": det, "lags": lags, "N": N, "T": T, "reps": int(reps),
+        "det": det, "lags": lags, "N": N, "T": T,
+        "reps": int(min((len(v) for v in null.values() if len(v)), default=reps)),
+        "repsRequested": int(reps),
         "rows": rows, "nSignificant": nsig, "nTests": len(PEDRONI_META),
         "decision": ("Eşbütünleşme vardır" if nsig >= 4 else
                      "Kısmi kanıt" if nsig >= 2 else "Eşbütünleşme yoktur"),
@@ -403,17 +405,17 @@ WEST_META = [("Gt", "Gt", "Grup ortalaması"), ("Ga", "Ga", "Grup ortalaması"),
              ("Pt", "Pt", "Panel"), ("Pa", "Pa", "Panel")]
 
 
-@lru_cache(maxsize=64)
 def _westerlund_null(N: int, T: int, k: int, det: str, p: int, q: int,
                      reps: int, seed: int = 314159):
-    rng = np.random.default_rng(seed + 17 * N + 5 * T + k + p + q + len(det))
-    acc = {key: [] for key, *_ in WEST_META}
-    for _ in range(reps):
+    def draw(rng):
         units = [(np.cumsum(rng.standard_normal(T)),
                   np.cumsum(rng.standard_normal((T, k)), axis=0)) for _ in range(N)]
-        r = _westerlund_raw(units, det, p, q)
-        if not r:
-            continue
+        return _westerlund_raw(units, det, p, q) or {}
+
+    rows, _ = mc_draws(("west", N, T, k, det, p, q), reps,
+                       seed + 17 * N + 5 * T + k + p + q + len(det), draw)
+    acc = {key: [] for key, *_ in WEST_META}
+    for r in rows:
         for key, *_ in WEST_META:
             v = r.get(key)
             if v is not None and np.isfinite(v):
@@ -454,7 +456,9 @@ def westerlund(pnl: Panel, det="c", p=1, q=1, reps=200):
                      "z": f(z), "p": f(pv), "sig": sig, "star": star(pv)})
     return {"name": "Westerlund (2007) Hata Düzeltme Tabanlı Panel Eşbütünleşme Testi",
             "h0": "Eşbütünleşme ilişkisi yoktur (hata düzeltme terimi anlamsızdır)",
-            "rows": rows, "N": N, "T": T, "reps": int(reps),
+            "rows": rows, "N": N, "T": T,
+            "reps": int(min((len(v) for v in null.values() if len(v)), default=reps)),
+            "repsRequested": int(reps),
             "nSignificant": nsig, "nTests": len(WEST_META),
             "decision": ("Eşbütünleşme vardır" if nsig >= 2 else
                          "Eşbütünleşme yoktur"),

@@ -1,14 +1,13 @@
 """Panel birim kok testleri: LLC, IPS, Fisher-ADF, Fisher-PP, Hadri."""
 from __future__ import annotations
 
-from functools import lru_cache
 
 import numpy as np
 from scipy import stats
 
 from .prepare import Panel
 from .utils import (adf_regression, bic_lag_select, f, mackinnon_adf_pvalue,
-                    newey_west_lrv, phillips_perron)
+                    mc_draws, newey_west_lrv, phillips_perron)
 
 TREND_LABEL = {"c": "Sabitli", "ct": "Sabitli ve Trendli", "n": "Sabitsiz"}
 
@@ -55,15 +54,15 @@ def _fast_adf_t(y, p, trend):
     return float(b[ndet] / np.sqrt(v))
 
 
-@lru_cache(maxsize=256)
 def _ips_moments(T: int, p: int, trend: str, reps: int = 2000, seed: int = 20240501):
     """IPS t-bar istatistigi icin bireysel ADF t-degerlerinin null momentleri."""
-    rng = np.random.default_rng(seed + 1000 * T + 10 * p + len(trend))
-    vals = np.empty(reps)
-    for r in range(reps):
-        y = np.cumsum(rng.standard_normal(T))
-        vals[r] = _fast_adf_t(y, p, trend)
-    v = vals[np.isfinite(vals)]
+    def draw(rng):
+        return _fast_adf_t(np.cumsum(rng.standard_normal(T)), p, trend)
+
+    vals, _ = mc_draws(("ips", T, p, trend), reps,
+                       seed + 1000 * T + 10 * p + len(trend), draw)
+    v = np.asarray(vals, float)
+    v = v[np.isfinite(v)]
     if v.size < 30:
         return (-1.5, 1.0)
     return (float(v.mean()), float(v.var(ddof=1)))
@@ -133,16 +132,16 @@ def _llc_pooled_t(series, p, trend):
     return float(delta / se)
 
 
-@lru_cache(maxsize=128)
 def _llc_null(N: int, T: int, p: int, trend: str, reps: int = 300,
               seed: int = 771103):
-    rng = np.random.default_rng(seed + 977 * N + 31 * T + 7 * p + len(trend))
-    out = np.empty(reps)
-    for r in range(reps):
+    def draw(rng):
         series = [np.cumsum(rng.standard_normal(T)) for _ in range(N)]
-        out[r] = _llc_pooled_t(series, p, trend)
-    v = out[np.isfinite(out)]
-    return v
+        return _llc_pooled_t(series, p, trend)
+
+    out, _ = mc_draws(("llc", N, T, p, trend), reps,
+                      seed + 977 * N + 31 * T + 7 * p + len(trend), draw)
+    v = np.asarray(out, float)
+    return v[np.isfinite(v)]
 
 
 def llc_test(series, p, trend, reps=300):
