@@ -1,6 +1,7 @@
 """ACF/PACF, otomatik ARIMA/SARIMA secimi, artik tanilari ve ongoru."""
 from __future__ import annotations
 
+import time
 import warnings
 
 import numpy as np
@@ -59,10 +60,10 @@ def _aicc(res, k, n):
     return aic + (2 * k * (k + 1) / den) if den > 0 else aic
 
 
-def _fit(y, order, seasonal, trend):
+def _fit(y, order, seasonal, trend, maxiter=100):
     return SARIMAX(y, order=order, seasonal_order=seasonal, trend=trend,
                    enforce_stationarity=False, enforce_invertibility=False
-                   ).fit(disp=False, maxiter=200)
+                   ).fit(disp=False, maxiter=maxiter)
 
 
 def ndiffs(y, max_d=2, alpha=0.05):
@@ -113,7 +114,7 @@ def nsdiffs(y, period, threshold=0.64):
 
 
 def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
-               max_P=1, max_Q=1, ic="aicc", trend_const=True):
+               max_P=1, max_Q=1, ic="aicc", trend_const=True, time_budget=None):
     """
     Izgara aramasi ile en iyi ARIMA/SARIMA modelini secer.
 
@@ -130,11 +131,19 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
         return None, [], {}
 
     dd = int(d) if d is not None else ndiffs(y)
-    use_seasonal = bool(seasonal and period > 1 and n >= 3 * period + 10)
-    if use_seasonal:
+    can_season = bool(seasonal and period > 1 and n >= 3 * period + 10)
+    if can_season:
         D, seas_strength = nsdiffs(y, period)
     else:
         D, seas_strength = 0, None
+
+    # Mevsimsellik zayifsa mevsimsel terimler hic denenmez. Bu, izgarayi
+    # (max_P+1)*(max_Q+1) kat kucultur: ceyreklik veride 64 tahminden 16'ya
+    # duser. Ucretsiz sunucu kaynaklarinda sure farki belirleyicidir.
+    weak_season = bool(can_season and D == 0 and
+                       (seas_strength is None or seas_strength < 0.30))
+    use_seasonal = bool(can_season and not weak_season)
+
     # asiri fark almayi engelle
     if dd + D > 2:
         dd = max(0, 2 - D)
@@ -143,37 +152,65 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
     Q_range = range(0, max_Q + 1) if use_seasonal else [0]
     trend = "c" if (trend_const and dd <= 1 and D == 0) else "n"
 
-    cands = []
+    # Bellek: 64 SARIMAXResults nesnesini ayni anda tutmak yuzlerce MB'a
+    # ulasabilir. Bu yuzden arama sirasinda yalnizca skorlar saklanir,
+    # kazanan model en sonda bir kez yeniden tahmin edilir.
+    # Izgara, toplam parametre sayisina gore sadeden karmasiga siralanir.
+    # Sure butcesi dolarsa arama kesilir; bu durumda geride birakilanlar en
+    # karmasik modeller olur, dolayisiyla kesinti sonucun kalitesini en az
+    # etkileyecek noktadan yapilmis olur.
+    grid = []
     for p in range(0, max_p + 1):
         for q in range(0, max_q + 1):
             for P in P_range:
                 for Q in Q_range:
                     if p + q + P + Q == 0 and dd == 0 and D == 0:
                         continue
-                    order = (p, dd, q)
-                    seas = (P, D, Q, period) if use_seasonal else (0, 0, 0, 0)
-                    try:
-                        res = _fit(y, order, seas, trend)
-                    except Exception:
-                        continue
-                    k = int(len(res.params))
-                    score = _aicc(res, k, n) if ic == "aicc" else \
-                        (float(res.bic) if ic == "bic" else float(res.aic))
-                    if not np.isfinite(score):
-                        continue
-                    cands.append({"order": order, "seasonal": seas,
-                                  "trend": trend, "score": score,
-                                  "aic": float(res.aic), "bic": float(res.bic),
-                                  "res": res})
+                    grid.append((p + q + 2 * (P + Q), p, q, P, Q))
+    grid.sort()
+
+    cands, deadline = [], (time.time() + float(time_budget) if time_budget else None)
+    truncated = False
+    for _, p, q, P, Q in grid:
+        if deadline and time.time() > deadline:
+            truncated = True
+            break
+        order = (p, dd, q)
+        seas = (P, D, Q, period) if use_seasonal else (0, 0, 0, 0)
+        try:
+            res = _fit(y, order, seas, trend)
+            k = int(len(res.params))
+            score = _aicc(res, k, n) if ic == "aicc" else \
+                (float(res.bic) if ic == "bic" else float(res.aic))
+            aic, bic = float(res.aic), float(res.bic)
+        except Exception:
+            continue
+        finally:
+            res = None              # sonuc nesnesini hemen serbest birak
+        if not np.isfinite(score):
+            continue
+        cands.append({"order": order, "seasonal": seas, "trend": trend,
+                      "score": score, "aic": aic, "bic": bic})
+
     if not cands:
         return None, [], {}
     cands.sort(key=lambda c: c["score"])
+
+    # kazananı yeniden tahmin et (yalnızca bir sonuç nesnesi bellekte kalır)
+    best = cands[0]
+    try:
+        best["res"] = _fit(y, best["order"], best["seasonal"], best["trend"],
+                           maxiter=300)
+    except Exception:
+        return None, [], {}
+
     meta = {"d": int(dd), "D": int(D), "period": int(period),
             "seasonalUsed": bool(use_seasonal),
+            "seasonalSkipped": bool(weak_season),
             "seasonalStrength": f(seas_strength, 3) if seas_strength is not None else None,
             "dSource": "kullanıcı" if d is not None else "ADF/KPSS testleri",
-            "nFitted": len(cands)}
-    return cands[0], cands[:6], meta
+            "nFitted": len(cands), "nGrid": len(grid), "truncated": truncated}
+    return best, cands[:6], meta
 
 
 def _order_str(order, seasonal):
@@ -254,14 +291,15 @@ def diagnostics(res, period=1, burn=0):
 
 
 def run(ts: TSData, var, d=None, max_p=3, max_q=3, seasonal=True,
-        horizon=5, ic="aicc", nlags=None):
+        horizon=5, ic="aicc", nlags=None, time_budget=45):
     y = ts.y(var)
     n = y.size
     if n < 15:
         return None
 
     best, top, meta = auto_arima(y, d=d, max_p=max_p, max_q=max_q,
-                                 period=ts.period, seasonal=seasonal, ic=ic)
+                                 period=ts.period, seasonal=seasonal, ic=ic,
+                                 time_budget=time_budget)
     if not best:
         return None
     res = best["res"]
