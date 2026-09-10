@@ -22,11 +22,15 @@ app.add_middleware(
 )
 
 # === PANEL VERI ANALIZI MODULU ===
+# Ekledigi uc noktalar: /panel-health, /panel-detect, /panel-analyze
 from panel_api import router as panel_router
 app.include_router(panel_router)
+
+# === ZAMAN SERISI ANALIZI MODULU ===
+# Ekledigi uc noktalar: /ts-health, /ts-detect, /ts-analyze
 from ts_api import router as ts_router
 app.include_router(ts_router)
-# =================================
+# ===================================
 
 class AnalysisRequest(BaseModel):
     depVar: str
