@@ -25,6 +25,7 @@ bu nedenle panel/ klasoruyle birlikte dagitilmalidir.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import traceback
@@ -69,6 +70,10 @@ def handle_analyze(payload: dict):
                               f"{type(exc).__name__}: {exc}",
                      "trace": traceback.format_exc(limit=4)
                      if os.getenv("PANEL_DEBUG") else None}
+    finally:
+        # Adim adim istekler arasinda statsmodels/arch nesnelerini hemen birak;
+        # 512 MB'lik Render Free ornegi icin belirgin fark yaratir.
+        gc.collect()
 
 
 def handle_detect(payload: dict):
