@@ -89,13 +89,19 @@ def analyze(payload: dict) -> dict:
     mods = dict(DEFAULT_MODULES)
     mods.update(payload.get("modules") or {})
 
+    # Adim adim (sirali) calisma modunda onceki adimin ciktilari "hints" ile
+    # tasinir; boylece her istek yalnizca kendi modulunu hesaplar.
+    hints = payload.get("hints") or {}
+    skip_plot = bool(payload.get("skipPlot"))
+
     res = {
         "ok": True, "engine": ENGINE, "meta": ts.info(),
         "detection": detected, "modules": mods, "options": dict(opts),
         "depVar": dep, "indepVars": indep,
         "warnings": [], "errors": {},
-        "plotSeries": ts.plot_series(),
     }
+    if not skip_plot:
+        res["plotSeries"] = ts.plot_series()
     if ts.dropped_na:
         res["warnings"].append(
             f"{ts.dropped_na} gözlem eksik veri (NaN) nedeniyle analiz dışı bırakıldı.")
@@ -131,7 +137,8 @@ def analyze(payload: dict) -> dict:
             res["errors"]["stationarity"] = str(exc)
             res["errors"]["stationarityTrace"] = traceback.format_exc(limit=3)
 
-    orders = (res.get("stationarity") or {}).get("orders", {})
+    orders = (res.get("stationarity") or {}).get("orders", {}) \
+        or (hints.get("orders") or {})
 
     # ---------------- ARIMA / SARIMA ----------------
     if mods.get("arima"):
@@ -150,7 +157,8 @@ def analyze(payload: dict) -> dict:
                 max_q=int(opts.get("arimaMaxQ", 3)),
                 seasonal=bool(opts.get("seasonal", True)),
                 horizon=int(opts.get("forecastH", 5)),
-                ic=str(opts.get("arimaIC", "aicc")))
+                ic=str(opts.get("arimaIC", "aicc")),
+                time_budget=float(opts.get("arimaTimeBudget", 45) or 45))
         except Exception as exc:
             res["errors"]["arima"] = str(exc)
             res["errors"]["arimaTrace"] = traceback.format_exc(limit=3)
@@ -179,7 +187,10 @@ def analyze(payload: dict) -> dict:
             if use_diff is None:
                 # tum seriler I(1) ve esbutunlesme yoksa fark al
                 ci = res.get("cointegration") or {}
-                has_ci = bool((ci.get("overall") or {}).get("cointegrated"))
+                if ci:
+                    has_ci = bool((ci.get("overall") or {}).get("cointegrated"))
+                else:
+                    has_ci = bool(hints.get("cointegrated"))
                 all_i1 = bool(orders) and all(v == "I(1)" for v in orders.values())
                 use_diff = bool(all_i1 and not has_ci)
             res["var"] = varmod.run(

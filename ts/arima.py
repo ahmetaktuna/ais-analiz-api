@@ -169,14 +169,26 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
                     grid.append((p + q + 2 * (P + Q), p, q, P, Q))
     grid.sort()
 
-    cands, deadline = [], (time.time() + float(time_budget) if time_budget else None)
+    # Zaman butcesi. Butcenin bir kismi kazananin yeniden tahmini icin ayrilir;
+    # ayrica bir sonraki tahminin butceyi asacagi ongoruluyorsa arama hic
+    # baslatilmaz. Boylece toplam sure yavas sunucularda da butceyi asmaz —
+    # tek asilan istek tarayicida "Failed to fetch" olarak gorunuyordu.
+    budget = float(time_budget) if time_budget else None
+    t_start = time.time()
+    search_end = (t_start + budget * 0.75) if budget else None
+    slowest = 0.0
+    cands = []
     truncated = False
     for _, p, q, P, Q in grid:
-        if deadline and time.time() > deadline:
-            truncated = True
-            break
+        if search_end:
+            now = time.time()
+            if now + slowest * 0.8 > search_end:
+                truncated = now > search_end or bool(cands)
+                if truncated:
+                    break
         order = (p, dd, q)
         seas = (P, D, Q, period) if use_seasonal else (0, 0, 0, 0)
+        t_fit = time.time()
         try:
             res = _fit(y, order, seas, trend)
             k = int(len(res.params))
@@ -187,6 +199,7 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
             continue
         finally:
             res = None              # sonuc nesnesini hemen serbest birak
+            slowest = max(slowest, time.time() - t_fit)
         if not np.isfinite(score):
             continue
         cands.append({"order": order, "seasonal": seas, "trend": trend,
@@ -198,9 +211,12 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
 
     # kazananı yeniden tahmin et (yalnızca bir sonuç nesnesi bellekte kalır)
     best = cands[0]
+    # kalan sureye gore yakinsama adimi: butce daralmissa daha az yineleme
+    left = (t_start + budget) - time.time() if budget else None
+    refit_iter = 300 if (left is None or left > 3 * max(slowest, 0.05)) else 150
     try:
         best["res"] = _fit(y, best["order"], best["seasonal"], best["trend"],
-                           maxiter=300)
+                           maxiter=refit_iter)
     except Exception:
         return None, [], {}
 
@@ -209,7 +225,8 @@ def auto_arima(y, d=None, max_p=3, max_q=3, period=1, seasonal=True,
             "seasonalSkipped": bool(weak_season),
             "seasonalStrength": f(seas_strength, 3) if seas_strength is not None else None,
             "dSource": "kullanıcı" if d is not None else "ADF/KPSS testleri",
-            "nFitted": len(cands), "nGrid": len(grid), "truncated": truncated}
+            "nFitted": len(cands), "nGrid": len(grid), "truncated": truncated,
+            "searchSeconds": round(time.time() - t_start, 2)}
     return best, cands[:6], meta
 
 
