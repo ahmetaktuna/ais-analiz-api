@@ -11,6 +11,7 @@ Uc noktalar:
     POST /kruskal-multiple      -> Kruskal-Wallis H + Dunn (ANOVA'nin karsiligi)
     POST /pairedttest-multiple  -> bagimli (eslestirilmis) orneklem t-testi
     POST /wilcoxon-multiple     -> Wilcoxon isaretli siralar (bagimli t'nin karsiligi)
+    POST /correlation-multiple  -> Pearson / Spearman korelasyon matrisi
 
 Panel veri ve zaman serisi modulleri ayri router'lar olarak eklenir.
 
@@ -1134,6 +1135,149 @@ def wilcoxon_multiple(req: PairedRequest):
     except Exception as e:
         log.exception("wilcoxon failed")
         return {"error": f"Wilcoxon İşaretli Sıralar Testi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# ==========================================================================
+# KORELASYON ANALIZI
+# --------------------------------------------------------------------------
+# Iki surekli degisken arasindaki dogrusal iliski:
+#   Parametrik      : Pearson korelasyon katsayisi (r)
+#   Non-parametrik  : Spearman sira korelasyonu (rho) — normallik ve
+#                     dogrusallik varsayimi gerektirmez, sirali (ordinal)
+#                     olceklerde ve uc degerli verilerde tercih edilir.
+#
+# Eksik veri: IKILI (pairwise) silme. Her degisken cifti icin yalnizca o
+# ciftte iki degeri de dolu olan gozlemler kullanilir; bu, SPSS'in varsayilan
+# davranisidir ve tek bir degiskendeki bosluklarin tum matrisi kucultmesini
+# onler. Bunun bedeli, hucrelerin farkli n degerlerine dayanmasidir; bu yuzden
+# n araligi yanitta ayrica dondurulur.
+# ==========================================================================
+
+MAX_CORR_VARS = int(os.getenv("AIS_MAX_CORR_VARS", "40"))
+
+
+class CorrelationRequest(BaseModel):
+    vars: List[str]
+    data: List[Dict[str, Any]]
+    method: Optional[str] = "pearson"       # "pearson" | "spearman"
+
+
+def _fisher_ci(r: float, n: int):
+    """Fisher z donusumu ile r icin %95 guven araligi."""
+    if n < 4 or not math.isfinite(r) or abs(r) >= 1.0:
+        return None, None
+    z = 0.5 * math.log((1.0 + r) / (1.0 - r))
+    se = 1.0 / math.sqrt(n - 3)
+    lo, hi = z - 1.959963984540054 * se, z + 1.959963984540054 * se
+    return math.tanh(lo), math.tanh(hi)
+
+
+@app.post("/correlation-multiple")
+def correlation_multiple(req: CorrelationRequest):
+    try:
+        secilen = [v for v in dict.fromkeys(req.vars or [])]   # sirayi koru
+        bad = _guard(req.data, secilen)
+        if bad:
+            return bad
+        if len(secilen) < 2:
+            return {"error": "Korelasyon analizi için en az iki değişken seçmelisiniz."}
+        if len(secilen) > MAX_CORR_VARS:
+            return {"error": f"Korelasyon matrisi en fazla {MAX_CORR_VARS} değişkenle "
+                             f"oluşturulabilir. Siz {len(secilen)} değişken seçtiniz."}
+
+        df = _frame(req.data, secilen)
+        bad = _missing(df, secilen)
+        if bad:
+            return bad
+
+        yontem = (req.method or "pearson").strip().lower()
+        if yontem not in ("pearson", "spearman"):
+            yontem = "pearson"
+
+        # Sayisala cevir; hicbir gecerli degeri olmayan veya SABIT olan
+        # degiskenler analiz disi birakilir (sabit degiskenle r tanimsizdir).
+        kolonlar, skipped = [], []
+        seriler = {}
+        for v in secilen:
+            s = pd.to_numeric(df[v], errors="coerce")
+            gecerli = s.dropna()
+            if gecerli.size < 3 or float(gecerli.std(ddof=1) or 0.0) <= 0:
+                skipped.append(v)
+                continue
+            kolonlar.append(v)
+            seriler[v] = s
+
+        k = len(kolonlar)
+        if k < 2:
+            return {"error": "Korelasyon için en az iki geçerli (sabit olmayan, "
+                             "en az 3 gözlemli) sayısal değişken gereklidir."}
+
+        betimsel = []
+        for v in kolonlar:
+            g = seriler[v].dropna().to_numpy(dtype=float)
+            betimsel.append({
+                "varName": v, "n": int(g.size),
+                "mean": _f(g.mean()), "std": _f(g.std(ddof=1)) if g.size > 1 else 0.0,
+                "min": _f(g.min()), "max": _f(g.max()),
+                "skewness": _f(stats.skew(g, bias=False)) if g.size > 3 else 0.0,
+                "kurtosis": _f(stats.kurtosis(g, bias=False)) if g.size > 4 else 0.0,
+            })
+
+        # --- ikili (pairwise) korelasyon matrisi ---
+        matris = [[None] * k for _ in range(k)]
+        n_min, n_max = None, None
+        for i in range(k):
+            matris[i][i] = {"r": 1.0, "p": 0.0, "n": int(seriler[kolonlar[i]].notna().sum()),
+                            "ciLow": None, "ciHigh": None, "diag": True}
+            for j in range(i + 1, k):
+                a = seriler[kolonlar[i]]
+                b = seriler[kolonlar[j]]
+                ok = a.notna() & b.notna()
+                xa = a[ok].to_numpy(dtype=float)
+                yb = b[ok].to_numpy(dtype=float)
+                n = int(xa.size)
+                if n < 3 or xa.std() == 0 or yb.std() == 0:
+                    hucre = {"r": None, "p": None, "n": n,
+                             "ciLow": None, "ciHigh": None}
+                else:
+                    try:
+                        if yontem == "spearman":
+                            res = stats.spearmanr(xa, yb)
+                            r_val, p_val = float(res.statistic), float(res.pvalue)
+                        else:
+                            res = stats.pearsonr(xa, yb)
+                            r_val, p_val = float(res.statistic), float(res.pvalue)
+                    except Exception:
+                        r_val, p_val = float("nan"), float("nan")
+                    if not math.isfinite(r_val):
+                        hucre = {"r": None, "p": None, "n": n,
+                                 "ciLow": None, "ciHigh": None}
+                    else:
+                        lo, hi = _fisher_ci(r_val, n)
+                        hucre = {"r": _f(r_val), "p": _f(p_val, 1.0), "n": n,
+                                 "ciLow": _fo(lo), "ciHigh": _fo(hi)}
+                    n_min = n if n_min is None else min(n_min, n)
+                    n_max = n if n_max is None else max(n_max, n)
+                matris[i][j] = hucre
+                matris[j][i] = dict(hucre)
+
+        return {
+            "test": ("Spearman Sıra Korelasyonu" if yontem == "spearman"
+                     else "Pearson Korelasyon"),
+            "method": yontem,
+            "statLabel": "rs" if yontem == "spearman" else "r",
+            "vars": kolonlar,
+            "matrix": matris,
+            "descriptives": betimsel,
+            "nMin": n_min, "nMax": n_max,
+            "deletion": "pairwise",
+            "skipped": skipped,
+        }
+    except Exception as e:
+        log.exception("correlation failed")
+        return {"error": f"Korelasyon Analizi Hatası: {e}"}
     finally:
         gc.collect()
 
