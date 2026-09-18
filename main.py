@@ -12,6 +12,7 @@ Uc noktalar:
     POST /pairedttest-multiple  -> bagimli (eslestirilmis) orneklem t-testi
     POST /wilcoxon-multiple     -> Wilcoxon isaretli siralar (bagimli t'nin karsiligi)
     POST /correlation-multiple  -> Pearson / Spearman korelasyon matrisi
+    POST /roc-multiple          -> ROC egrisi analizi (AUC, DeLong, kesme noktasi)
 
 Panel veri ve zaman serisi modulleri ayri router'lar olarak eklenir.
 
@@ -1278,6 +1279,348 @@ def correlation_multiple(req: CorrelationRequest):
     except Exception as e:
         log.exception("correlation failed")
         return {"error": f"Korelasyon Analizi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# ==========================================================================
+# ROC EGRISI ANALIZI
+# --------------------------------------------------------------------------
+# Tanisal dogruluk calismalarinin standart araci. Surekli bir belirtecin
+# (marker/test) ikili bir durumu (hasta / saglikli) ne kadar iyi ayirt
+# ettigini olcer.
+#
+# Egri altinda kalan alan (AUC) ve standart hatasi DeLong, DeLong ve
+# Clarke-Pearson (1988) yontemiyle hesaplanir; Sun ve Xu (2014) hizli
+# algoritmasi kullanilir. Bu yontem hem tek bir AUC'nin guven araligini hem
+# de AYNI hastalarda olculen iki belirtecin AUC farkinin testini ayni
+# kovaryans yapisindan uretir; eslesmis (paired) karsilastirma icin dogru
+# olan budur.
+#
+# Optimal kesme noktasi Youden indeksi (J = duyarlilik + ozgulluk - 1) ile
+# secilir. Oranlarin guven araliklari Wilson skor yontemiyle, olabilirlik
+# oranlarininki Simel ve ark. (1991) log yontemiyle hesaplanir.
+# ==========================================================================
+
+MAX_ROC_MARKERS = int(os.getenv("AIS_MAX_ROC_MARKERS", "10"))
+MAX_ROC_POINTS = 400          # egri cizimi icin dondurulen nokta sayisi tavani
+
+
+class ROCRequest(BaseModel):
+    statusVar: str
+    positive: Any                              # pozitif (hasta) duzeyin degeri
+    markers: List[Dict[str, Any]]              # [{"name":..., "direction":"higher"|"lower"}]
+    data: List[Dict[str, Any]]
+    prevalence: Optional[float] = None         # 0-1; verilirse PPD/NPD yeniden hesaplanir
+
+
+def _wilson(k: float, n: float):
+    """Bir oran icin Wilson skor guven araligi (%95)."""
+    if n <= 0:
+        return None, None
+    z = 1.959963984540054
+    p = k / n
+    den = 1.0 + z * z / n
+    orta = (p + z * z / (2.0 * n)) / den
+    yari = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / den
+    return max(0.0, orta - yari), min(1.0, orta + yari)
+
+
+def _midrank(x: np.ndarray) -> np.ndarray:
+    """Baglanmalarda ortalama sira (DeLong algoritmasinin cekirdegi)."""
+    J = np.argsort(x, kind="mergesort")
+    Z = x[J]
+    N = Z.size
+    T = np.zeros(N, dtype=float)
+    i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    T2 = np.empty(N, dtype=float)
+    T2[J] = T
+    return T2
+
+
+def _delong(pos: np.ndarray, neg: np.ndarray):
+    """AUC vektoru ve kovaryans matrisi.
+
+    pos : (k, m) pozitif (hasta) olgularin k belirtecteki skorlari
+    neg : (k, n) negatif olgularin skorlari
+    Ayni olgular uzerinde calisildigi icin dondurulen kovaryans, eslesmis
+    AUC farkinin varyansini da verir.
+    """
+    k, m = pos.shape
+    n = neg.shape[1]
+    tx = np.vstack([_midrank(pos[r]) for r in range(k)])
+    ty = np.vstack([_midrank(neg[r]) for r in range(k)])
+    tz = np.vstack([_midrank(np.concatenate([pos[r], neg[r]])) for r in range(k)])
+    aucs = (tz[:, :m].sum(axis=1) / m - (m + 1.0) / 2.0) / n
+    v01 = (tz[:, :m] - tx) / n                 # hasta olgularin katkisi
+    v10 = 1.0 - (tz[:, m:] - ty) / m           # saglikli olgularin katkisi
+    sx = np.cov(v01, ddof=1).reshape(k, k)
+    sy = np.cov(v10, ddof=1).reshape(k, k)
+    S = sx / m + sy / n
+    return aucs, S
+
+
+def _roc_egrisi(skor: np.ndarray, etiket: np.ndarray):
+    """Butun esiklerde (1-ozgulluk, duyarlilik) ciftlerini uretir.
+
+    Kural: skor >= esik ise test POZITIF. Baglanmalarda ayni degere sahip
+    gozlemler birlikte degerlendirilir; aksi halde egri, aslinda ayirt
+    edilemeyen noktalarda merdiven yaparak AUC'yi oldugundan iyi gosterir.
+    """
+    sira = np.argsort(-skor, kind="mergesort")
+    s = skor[sira]
+    y = etiket[sira]
+    # ayni skor degerinin son indeksi
+    farkli = np.where(np.diff(s))[0]
+    kesim = np.r_[farkli, s.size - 1]
+    tp = np.cumsum(y)[kesim]
+    fp = (kesim + 1) - tp
+    P = float(y.sum())
+    N = float(y.size - P)
+    tpr = np.r_[0.0, tp / P] if P > 0 else np.zeros(kesim.size + 1)
+    fpr = np.r_[0.0, fp / N] if N > 0 else np.zeros(kesim.size + 1)
+    esik = np.r_[np.inf, s[kesim]]
+    return fpr, tpr, esik, np.r_[0.0, tp], np.r_[0.0, fp], P, N
+
+
+@app.post("/roc-multiple")
+def roc_multiple(req: ROCRequest):
+    try:
+        adlar, etiketler = [], {}
+        for m in (req.markers or []):
+            ad = m.get("name")
+            if isinstance(ad, str) and ad and ad not in adlar:
+                adlar.append(ad)
+                etiketler[ad] = m
+        cols = [req.statusVar] + adlar
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        if not adlar:
+            return {"error": "En az bir test (belirteç) değişkeni seçmelisiniz."}
+        if len(adlar) > MAX_ROC_MARKERS:
+            return {"error": f"Aynı anda en fazla {MAX_ROC_MARKERS} belirteç "
+                             f"analiz edilebilir. Siz {len(adlar)} seçtiniz."}
+        if req.statusVar in adlar:
+            return {"error": "Durum (altın standart) değişkeni aynı zamanda "
+                             "test değişkeni olamaz."}
+
+        df = _frame(req.data, cols)
+        bad = _missing(df, cols)
+        if bad:
+            return bad
+        df = df.dropna(subset=[req.statusVar])
+
+        duzeyler = _sorted_levels(df[req.statusVar])
+        if len(duzeyler) != 2:
+            return {"error": f"Durum değişkeninizde tam olarak 2 kategori olmalıdır "
+                             f"(hasta / sağlıklı). Sizde {len(duzeyler)} bulundu."}
+        poz_deger = req.positive
+        eslesen = [g for g in duzeyler if str(g) == str(poz_deger)]
+        if not eslesen:
+            return {"error": "Pozitif (hasta) olarak belirttiğiniz değer, durum "
+                             "değişkeninde bulunamadı."}
+        poz_deger = eslesen[0]
+        neg_deger = [g for g in duzeyler if str(g) != str(poz_deger)][0]
+        y_tum = (df[req.statusVar].astype(str) == str(poz_deger)).to_numpy()
+
+        prevalans = None
+        if req.prevalence is not None:
+            try:
+                pv = float(req.prevalence)
+                if 0.0 < pv < 1.0:
+                    prevalans = pv
+            except (TypeError, ValueError):
+                prevalans = None
+
+        sonuclar, skipped = [], []
+        skorlar = {}                   # DeLong karsilastirmasi icin saklanir
+        for ad in adlar:
+            yon = str(etiketler[ad].get("direction") or "higher").lower()
+            ham = pd.to_numeric(df[ad], errors="coerce")
+            ok = ham.notna().to_numpy()
+            x = ham[ok].to_numpy(dtype=float)
+            y = y_tum[ok]
+            n_poz = int(y.sum())
+            n_neg = int(y.size - n_poz)
+            if n_poz < 3 or n_neg < 3 or np.unique(x).size < 2:
+                skipped.append(ad)
+                continue
+
+            # "Dusuk deger hastalik" secildiyse skoru ters cevir; boylece
+            # butun hesaplar tek bir kuralla ("skor >= esik -> pozitif")
+            # yurur, esik degeri rapor edilirken orijinal olcege donulur.
+            ters = (yon == "lower")
+            skor = -x if ters else x
+            skorlar[ad] = (skor, y, ok)
+
+            fpr, tpr, esik, tp, fp, P, N = _roc_egrisi(skor, y.astype(float))
+            auc_v, S = _delong(skor[y].reshape(1, -1), skor[~y].reshape(1, -1))
+            auc = float(auc_v[0])
+            se = float(math.sqrt(max(S[0, 0], 0.0)))   # GUVEN ARALIGI icin
+
+            # H0: AUC = 0,5 SINAMASI
+            # ------------------------------------------------------------
+            # DeLong standart hatasi guven araligi icin dogrudur ama sifir
+            # hipotezi ALTINDAKI standart hata degildir; mukemmel ayrimda
+            # (AUC = 1) sifira indigi icin test yapilamaz hale gelir. Sinama
+            # bu yuzden AUC = 0,5'in tam esdegeri olan Mann-Whitney U
+            # dagilimindan, baglanma duzeltmeli sifir varyansiyla yapilir.
+            _, tie_sum = _ranks_with_ties(skor)
+            NN = float(P_n := (n_poz + n_neg))
+            var0 = (n_poz * n_neg / 12.0) * ((NN + 1.0) - tie_sum / (NN * (NN - 1.0))) \
+                if NN > 1 else 0.0
+            se0 = math.sqrt(max(var0, 0.0)) / (n_poz * n_neg) if var0 > 0 else 0.0
+            z_auc = (auc - 0.5) / se0 if se0 > 0 else 0.0
+            p_auc = _f(2.0 * stats.norm.sf(abs(z_auc)), 1.0)
+
+            # ---- Youden indeksiyle optimal kesme noktasi ----
+            J = tpr - fpr
+            i_opt = int(np.argmax(J))
+            if i_opt == 0 and J.size > 1:          # (0,0) noktasi secilmesin
+                i_opt = int(np.argmax(J[1:])) + 1
+            duy = float(tpr[i_opt])
+            ozg = float(1.0 - fpr[i_opt])
+            GP = float(tp[i_opt])                  # gercek pozitif
+            YP = float(fp[i_opt])                  # yanlis pozitif
+            YN = P - GP
+            GN = N - YP
+            kesme_skor = float(esik[i_opt])
+            kesme = -kesme_skor if ters else kesme_skor
+            if not math.isfinite(kesme):
+                kesme = float(x.max()) if not ters else float(x.min())
+
+            dogruluk = (GP + GN) / (P + N) if (P + N) > 0 else 0.0
+            ppd = GP / (GP + YP) if (GP + YP) > 0 else None
+            npd = GN / (GN + YN) if (GN + YN) > 0 else None
+
+            # olabilirlik oranlari + Simel log guven araligi
+            lr_arti = lr_eksi = None
+            lr_arti_ci = lr_eksi_ci = (None, None)
+            if ozg < 1.0 and duy > 0:
+                lr_arti = duy / (1.0 - ozg)
+                sh = math.sqrt((1 - duy) / (duy * P) + ozg / ((1 - ozg) * N))
+                lr_arti_ci = (math.exp(math.log(lr_arti) - 1.96 * sh),
+                              math.exp(math.log(lr_arti) + 1.96 * sh))
+            if ozg > 0 and duy < 1.0:
+                lr_eksi = (1.0 - duy) / ozg
+                sh = math.sqrt(duy / ((1 - duy) * P) + (1 - ozg) / (ozg * N))
+                lr_eksi_ci = (math.exp(math.log(lr_eksi) - 1.96 * sh),
+                              math.exp(math.log(lr_eksi) + 1.96 * sh))
+
+            # kullanicinin verdigi toplum prevalansina gore PPD/NPD (Bayes)
+            ppd_pr = npd_pr = None
+            if prevalans is not None and duy > 0 and ozg > 0:
+                pay = duy * prevalans
+                payda = pay + (1.0 - ozg) * (1.0 - prevalans)
+                ppd_pr = pay / payda if payda > 0 else None
+                pay2 = ozg * (1.0 - prevalans)
+                payda2 = pay2 + (1.0 - duy) * prevalans
+                npd_pr = pay2 / payda2 if payda2 > 0 else None
+
+            duy_ci = _wilson(GP, P)
+            ozg_ci = _wilson(GN, N)
+            dog_ci = _wilson(GP + GN, P + N)
+            ppd_ci = _wilson(GP, GP + YP) if (GP + YP) > 0 else (None, None)
+            npd_ci = _wilson(GN, GN + YN) if (GN + YN) > 0 else (None, None)
+
+            # ---- cizim icin egri noktalari (seyreltilir) ----
+            secim = np.arange(fpr.size)
+            if fpr.size > MAX_ROC_POINTS:
+                secim = np.unique(np.r_[
+                    np.linspace(0, fpr.size - 1, MAX_ROC_POINTS - 2).astype(int),
+                    0, i_opt, fpr.size - 1])
+            noktalar = [{"fpr": _f(fpr[i]), "tpr": _f(tpr[i])} for i in secim]
+            opt_sira = int(np.searchsorted(secim, i_opt))
+
+            sonuclar.append({
+                "name": ad,
+                "label": etiketler[ad].get("label") or ad,
+                "direction": "lower" if ters else "higher",
+                "n": int(P + N), "nPos": int(P), "nNeg": int(N),
+                "auc": _f(auc), "se": _f(se), "seNull": _f(se0),
+                "ciLow": _f(max(0.0, auc - 1.959963984540054 * se)),
+                "ciHigh": _f(min(1.0, auc + 1.959963984540054 * se)),
+                "z": _f(z_auc), "p": p_auc,
+                "cutoff": _f(kesme),
+                "sens": _f(duy), "sensLow": _fo(duy_ci[0]), "sensHigh": _fo(duy_ci[1]),
+                "spec": _f(ozg), "specLow": _fo(ozg_ci[0]), "specHigh": _fo(ozg_ci[1]),
+                "ppv": _fo(ppd), "ppvLow": _fo(ppd_ci[0]), "ppvHigh": _fo(ppd_ci[1]),
+                "npv": _fo(npd), "npvLow": _fo(npd_ci[0]), "npvHigh": _fo(npd_ci[1]),
+                "lrPos": _fo(lr_arti), "lrPosLow": _fo(lr_arti_ci[0]), "lrPosHigh": _fo(lr_arti_ci[1]),
+                "lrNeg": _fo(lr_eksi), "lrNegLow": _fo(lr_eksi_ci[0]), "lrNegHigh": _fo(lr_eksi_ci[1]),
+                "accuracy": _f(dogruluk), "accLow": _fo(dog_ci[0]), "accHigh": _fo(dog_ci[1]),
+                "youden": _f(duy + ozg - 1.0),
+                "tp": int(GP), "fn": int(YN), "fp": int(YP), "tn": int(GN),
+                "ppvPrev": _fo(ppd_pr), "npvPrev": _fo(npd_pr),
+                "curve": noktalar, "optIndex": opt_sira,
+            })
+
+        if not sonuclar:
+            return {"error": "Hiçbir belirteç için ROC eğrisi hesaplanamadı. "
+                             "Her iki grupta da en az 3 geçerli gözlem ve testte "
+                             "en az iki farklı değer bulunmalıdır."}
+
+        # ---- DeLong ile ikili AUC karsilastirmalari ----
+        karsilastirmalar = []
+        gecerli = [s["name"] for s in sonuclar]
+        for a, bnm in itertools.combinations(gecerli, 2):
+            sa, ya, oka = skorlar[a]
+            sb, yb, okb = skorlar[bnm]
+            ortak = oka & okb                       # iki testin de olculdugu olgular
+            if int(ortak.sum()) < 8:
+                continue
+            xa = pd.to_numeric(df[a], errors="coerce").to_numpy(dtype=float)[ortak]
+            xb = pd.to_numeric(df[bnm], errors="coerce").to_numpy(dtype=float)[ortak]
+            if next(s for s in sonuclar if s["name"] == a)["direction"] == "lower":
+                xa = -xa
+            if next(s for s in sonuclar if s["name"] == bnm)["direction"] == "lower":
+                xb = -xb
+            yo = y_tum[ortak]
+            if int(yo.sum()) < 3 or int((~yo).sum()) < 3:
+                continue
+            P2 = np.vstack([xa[yo], xb[yo]])
+            N2 = np.vstack([xa[~yo], xb[~yo]])
+            auc2, S2 = _delong(P2, N2)
+            fark = float(auc2[0] - auc2[1])
+            var = float(S2[0, 0] + S2[1, 1] - 2.0 * S2[0, 1])
+            if var <= 0:
+                zc, pc, lo, hi, seF = 0.0, 1.0, fark, fark, 0.0
+            else:
+                seF = math.sqrt(var)
+                zc = fark / seF
+                pc = _f(2.0 * stats.norm.sf(abs(zc)), 1.0)
+                lo = fark - 1.959963984540054 * seF
+                hi = fark + 1.959963984540054 * seF
+            karsilastirmalar.append({
+                "a": a, "b": bnm,
+                "aucA": _f(auc2[0]), "aucB": _f(auc2[1]),
+                "diff": _f(fark), "se": _f(seF),
+                "ciLow": _f(lo), "ciHigh": _f(hi),
+                "z": _f(zc), "p": _f(pc, 1.0),
+                "n": int(ortak.sum()),
+                "sig": bool(pc < 0.05),
+            })
+
+        return {
+            "test": "ROC Eğrisi Analizi",
+            "statusVar": req.statusVar,
+            "positive": str(poz_deger),
+            "negative": str(neg_deger),
+            "prevalence": prevalans,
+            "results": sonuclar,
+            "comparisons": karsilastirmalar,
+            "skipped": skipped,
+        }
+    except Exception as e:
+        log.exception("roc failed")
+        return {"error": f"ROC Analizi Hatası: {e}"}
     finally:
         gc.collect()
 
