@@ -13,6 +13,7 @@ Uc noktalar:
     POST /wilcoxon-multiple     -> Wilcoxon isaretli siralar (bagimli t'nin karsiligi)
     POST /correlation-multiple  -> Pearson / Spearman korelasyon matrisi
     POST /roc-multiple          -> ROC egrisi analizi (AUC, DeLong, kesme noktasi)
+    POST /logistic              -> lojistik regresyon (ikili / sirali / cok kategorili)
 
 Panel veri ve zaman serisi modulleri ayri router'lar olarak eklenir.
 
@@ -1621,6 +1622,701 @@ def roc_multiple(req: ROCRequest):
     except Exception as e:
         log.exception("roc failed")
         return {"error": f"ROC Analizi Hatası: {e}"}
+    finally:
+        gc.collect()
+
+
+# ==========================================================================
+# LOJISTIK REGRESYON
+# --------------------------------------------------------------------------
+# Uc model turu:
+#   binary       : ikili bagimli degisken (Var/Yok)           -> Logit
+#   ordinal      : sirali bagimli degisken (Dusuk/Orta/Yuksek)-> OrderedModel
+#                  (orantili odds / paralel egrilik modeli)
+#   multinomial  : sirasiz uc+ kategori                        -> MNLogit
+#
+# Kategorik bagimsiz degiskenler REFERANS KATEGORI secilerek kukla (dummy)
+# kodlanir; boylece "Egitim (ref: Ilkokul)" bicimindeki SPSS duzeni uretilir.
+#
+# Degisken secimi: Enter (hepsi birlikte), Backward LR ve Forward LR. Adimsal
+# yontemlerde bir kategorik degiskenin BUTUN kuklalari birlikte girer ya da
+# birlikte cikar; tek tek islem gormeleri modeli anlamsiz hale getirirdi.
+# ==========================================================================
+
+MAX_LOJ_VARS = int(os.getenv("AIS_MAX_LOJ_VARS", "30"))
+MAX_LOJ_LEVELS = int(os.getenv("AIS_MAX_LOJ_LEVELS", "12"))
+
+
+class LogisticRequest(BaseModel):
+    depVar: str
+    modelType: Optional[str] = "binary"          # binary | ordinal | multinomial
+    positive: Optional[Any] = None               # ikili modelde olay kategorisi
+    reference: Optional[Any] = None              # cok kategorilide referans
+    levelOrder: Optional[List[Any]] = None       # sirali modelde duzey sirasi
+    numericVars: Optional[List[str]] = None
+    categoricalVars: Optional[List[Dict[str, Any]]] = None   # [{"name":..,"reference":..}]
+    method: Optional[str] = "enter"              # enter | backward | forward
+    pEnter: Optional[float] = 0.05
+    pRemove: Optional[float] = 0.10
+    data: List[Dict[str, Any]]
+
+
+# --------------------------------------------------------------------------
+# Tasarim matrisi
+# --------------------------------------------------------------------------
+
+def _loj_tasarim(df, sayisal, kategorik):
+    """Sayisal ve kukla kodlanmis sutunlardan tasarim matrisi kurar.
+
+    Donen 'bloklar' listesi, adimsal yontemin bir degiskenin butun
+    kuklalarini birlikte ele alabilmesi icindir.
+    """
+    parcalar, bloklar, uyarilar = [], [], []
+
+    for v in sayisal:
+        s = pd.to_numeric(df[v], errors="coerce")
+        parcalar.append(pd.DataFrame({v: s}))
+        bloklar.append({"ad": v, "tur": "sayisal", "sutunlar": [v], "ref": None})
+
+    for k in kategorik:
+        ad = k.get("name")
+        if not ad or ad not in df.columns:
+            continue
+        ham = df[ad]
+        duzeyler = _sorted_levels(ham)
+        if len(duzeyler) < 2:
+            uyarilar.append(f"{ad} tek kategoriden oluştuğu için modele alınmadı.")
+            continue
+        if len(duzeyler) > MAX_LOJ_LEVELS:
+            uyarilar.append(f"{ad} değişkeninde {len(duzeyler)} kategori var; "
+                            f"en fazla {MAX_LOJ_LEVELS} kategori işlenebilir.")
+            continue
+        ref = k.get("reference")
+        eslesen = [g for g in duzeyler if str(g) == str(ref)]
+        if ref is not None and not eslesen:
+            uyarilar.append(f"{ad} için belirtilen referans kategori bulunamadı; "
+                            f"ilk kategori (\u201c{duzeyler[0]}\u201d) referans alındı.")
+        ref = eslesen[0] if eslesen else duzeyler[0]
+        digerleri = [g for g in duzeyler if str(g) != str(ref)]
+        sut = {}
+        for g in digerleri:
+            kolon = f"{ad}[{g}]"
+            sut[kolon] = (ham.astype(str) == str(g)).astype(float)
+        parcalar.append(pd.DataFrame(sut, index=df.index))
+        bloklar.append({"ad": ad, "tur": "kategorik", "sutunlar": list(sut.keys()),
+                        "ref": str(ref), "duzeyler": [str(g) for g in duzeyler]})
+
+    X = pd.concat(parcalar, axis=1) if parcalar else pd.DataFrame(index=df.index)
+    return X, bloklar, uyarilar
+
+
+# --------------------------------------------------------------------------
+# Model uydurma (uc tur icin ortak arayuz)
+# --------------------------------------------------------------------------
+
+class _BosModelSonuc(object):
+    """Yalnizca sabit terim (ya da sirali modelde yalnizca esikler) iceren
+    modelin sonucu. statsmodels'in OrderedModel'i sifir sutunlu tasarim
+    matrisini kabul etmedigi icin bos modelin log olabilirligi analitik
+    olarak verilir; uc model turunde de ayni degeri uretir."""
+
+    def __init__(self, llf):
+        self.llf = float(llf)
+        self.params = np.array([])
+
+
+def _bos_ll(y):
+    """Yordayicisiz modelin log olabilirligi: toplam n_k * ln(n_k / n)."""
+    say = pd.Series(np.asarray(y)).value_counts()
+    n = float(say.sum())
+    if n <= 0:
+        return float("nan")
+    return float(sum(c * math.log(c / n) for c in say.values if c > 0))
+
+
+def _loj_fit(tur, X, y, kSinif):
+    """Secilen turde modeli uydurur; yakinsamazsa None doner."""
+    import warnings
+    if X.shape[1] == 0:                 # yordayicisiz (bos) model
+        return _BosModelSonuc(_bos_ll(y))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            if tur == "ordinal":
+                from statsmodels.miscmodels.ordinal_model import OrderedModel
+                m = OrderedModel(y, X, distr="logit") if X.shape[1] else \
+                    OrderedModel(y, np.empty((len(y), 0)), distr="logit")
+                return m.fit(method="bfgs", maxiter=200, disp=False)
+            if tur == "multinomial":
+                Xc = sm.add_constant(X, has_constant="add") if X.shape[1] else \
+                    pd.DataFrame({"const": np.ones(len(y))}, index=y.index)
+                return sm.MNLogit(y, Xc).fit(method="newton", maxiter=100, disp=False)
+            Xc = sm.add_constant(X, has_constant="add") if X.shape[1] else \
+                pd.DataFrame({"const": np.ones(len(y))}, index=y.index)
+            return sm.Logit(y, Xc).fit(method="newton", maxiter=100, disp=False)
+        except Exception:
+            try:                        # newton takilirsa daha dayanikli yontem
+                if tur == "multinomial":
+                    return sm.MNLogit(y, Xc).fit(method="bfgs", maxiter=400, disp=False)
+                if tur == "binary":
+                    return sm.Logit(y, Xc).fit(method="bfgs", maxiter=400, disp=False)
+            except Exception:
+                return None
+            return None
+
+
+def _loj_ll(tur, X, y, kSinif):
+    r = _loj_fit(tur, X, y, kSinif)
+    return (None, None) if r is None else (float(r.llf), int(_loj_npar(tur, r, X, kSinif)))
+
+
+def _loj_npar(tur, res, X, kSinif):
+    """Modeldeki egim parametresi sayisi (sabit/esikler haric)."""
+    p = X.shape[1]
+    return p if tur != "multinomial" else p * (kSinif - 1)
+
+
+# --------------------------------------------------------------------------
+# Paralel egrilik (orantili odds) sinamasi -- Brant (1990)
+# --------------------------------------------------------------------------
+
+def _brant(X, y, kSinif, bloklar=None):
+    """Brant (1990, Biometrics 46, 1171-1178) paralel egrilik sinamasi.
+
+    Sirali bagimli degiskenin K-1 kumulatif bolunmesi icin (Y > j) ayri ayri
+    ikili lojistik modeller uydurulur; orantili odds varsayimi, bu modellerin
+    egim vektorlerinin birbirine esit olmasini gerektirir. Esitlik, modeller
+    arasi kovaryansi Brant'in verdigi formulle hesaplanan Wald tipi bir
+    ki-kare ile sinanir. Anlamli (kucuk p) sonuc varsayimin ihlal edildigini
+    gosterir. Genel sinamanin yani sira her degisken icin ayri sinama da
+    dondurulur.
+    """
+    import warnings
+    n, p = X.shape
+    J = int(kSinif) - 1
+    if J < 2 or p < 1 or n <= p + 2:
+        return None
+    Xd = np.column_stack([np.ones(n), np.asarray(X, dtype=float)])   # n x (p+1)
+    yv = np.asarray(y, dtype=int)
+    betalar, piler = [], []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for j in range(J):
+            hedef = (yv > j).astype(int)
+            if hedef.sum() < 2 or hedef.sum() > n - 2:
+                return None
+            r = None
+            for yont in ("newton", "bfgs"):
+                try:
+                    r = sm.Logit(hedef, Xd).fit(method=yont, maxiter=500, disp=False)
+                    break
+                except Exception:
+                    r = None
+            if r is None:
+                return None
+            b = np.asarray(r.params, dtype=float)
+            pi = np.asarray(r.predict(Xd), dtype=float)
+            if not np.all(np.isfinite(b)) or not np.all(np.isfinite(pi)):
+                return None
+            betalar.append(b)
+            piler.append(pi)
+
+    k = p + 1
+    try:
+        ters = [np.linalg.inv(Xd.T @ (Xd * (piler[j] * (1.0 - piler[j]))[:, None]))
+                for j in range(J)]
+    except np.linalg.LinAlgError:
+        return None
+
+    V = np.zeros((J * k, J * k))
+    for j in range(J):
+        V[j * k:(j + 1) * k, j * k:(j + 1) * k] = ters[j]
+    for j in range(J):
+        for l in range(j + 1, J):
+            # Cov(1{Y>j}, 1{Y>l}) = pi_l - pi_j * pi_l   (j < l oldugundan)
+            w = piler[l] - piler[j] * piler[l]
+            M = ters[j] @ (Xd.T @ (Xd * w[:, None])) @ ters[l]
+            V[j * k:(j + 1) * k, l * k:(l + 1) * k] = M
+            V[l * k:(l + 1) * k, j * k:(j + 1) * k] = M.T
+    beta = np.concatenate(betalar)
+
+    def wald(sutunlar):
+        satirlar = []
+        for c in sutunlar:                       # sabit terim (0) disinda
+            for j in range(J - 1):
+                d = np.zeros(J * k)
+                d[j * k + c] = 1.0
+                d[(j + 1) * k + c] = -1.0
+                satirlar.append(d)
+        if not satirlar:
+            return None
+        D = np.vstack(satirlar)
+        fark = D @ beta
+        try:
+            orta = np.linalg.inv(D @ V @ D.T)
+        except np.linalg.LinAlgError:
+            return None
+        ki = float(fark @ orta @ fark)
+        if not math.isfinite(ki):
+            return None
+        sd = int(D.shape[0])
+        return {"chi2": _f(max(ki, 0.0)), "df": sd,
+                "p": _f(stats.chi2.sf(max(ki, 0.0), sd), 1.0)}
+
+    genel = wald(list(range(1, k)))
+    if genel is None:
+        return None
+    terimler = []
+    if bloklar:
+        adlar = list(X.columns)
+        for b in bloklar:
+            idx = [adlar.index(c) + 1 for c in b["sutunlar"] if c in adlar]
+            t = wald(idx)
+            if t:
+                t["term"] = b["ad"]
+                terimler.append(t)
+    genel["terms"] = terimler
+    return genel
+
+
+# --------------------------------------------------------------------------
+# Adimsal degisken secimi (olabilirlik orani olcutu)
+# --------------------------------------------------------------------------
+
+def _loj_stepwise(tur, X, y, bloklar, yontem, p_giris, p_cikis, kSinif):
+    """SPSS'in "Backward LR" / "Forward LR" mantigi.
+
+    Her adimda bir DEGISKEN (kategorikse butun kuklalariyla) modele girer ya
+    da modelden cikar; olcut, o degiskeni cikarmanin/eklemenin olabilirlik
+    oraninda yarattigi ki-kare degisiminin p degeridir.
+    """
+    adimlar = []
+    if yontem == "backward":
+        secili = [b["ad"] for b in bloklar]
+    else:
+        secili = []
+
+    def mat(adlar):
+        kolonlar = [c for b in bloklar if b["ad"] in adlar for c in b["sutunlar"]]
+        return X[kolonlar] if kolonlar else X.iloc[:, :0]
+
+    for adim in range(1, len(bloklar) * 2 + 2):
+        ll_tam, k_tam = _loj_ll(tur, mat(secili), y, kSinif)
+        if ll_tam is None:
+            break
+
+        if yontem == "backward":
+            if not secili:
+                break
+            en_iyi, en_iyi_p, en_iyi_ki = None, -1.0, None
+            for b in bloklar:
+                if b["ad"] not in secili:
+                    continue
+                kalan = [a for a in secili if a != b["ad"]]
+                ll_az, k_az = _loj_ll(tur, mat(kalan), y, kSinif)
+                if ll_az is None:
+                    continue
+                ki = 2.0 * (ll_tam - ll_az)
+                sd = max(k_tam - k_az, 1)
+                p = float(stats.chi2.sf(max(ki, 0.0), sd))
+                if p > en_iyi_p:
+                    en_iyi, en_iyi_p, en_iyi_ki, en_iyi_sd = b["ad"], p, ki, sd
+            if en_iyi is None or en_iyi_p <= p_cikis:
+                break
+            secili = [a for a in secili if a != en_iyi]
+            adimlar.append({"adim": adim, "islem": "çıkarıldı", "degisken": en_iyi,
+                            "ki2": _f(en_iyi_ki), "df": int(en_iyi_sd),
+                            "p": _f(en_iyi_p, 1.0),
+                            "kalan": list(secili)})
+        else:
+            adaylar = [b for b in bloklar if b["ad"] not in secili]
+            if not adaylar:
+                break
+            en_iyi, en_iyi_p, en_iyi_ki = None, 2.0, None
+            for b in adaylar:
+                yeni = secili + [b["ad"]]
+                ll_c, k_c = _loj_ll(tur, mat(yeni), y, kSinif)
+                if ll_c is None:
+                    continue
+                ki = 2.0 * (ll_c - ll_tam)
+                sd = max(k_c - k_tam, 1)
+                p = float(stats.chi2.sf(max(ki, 0.0), sd))
+                if p < en_iyi_p:
+                    en_iyi, en_iyi_p, en_iyi_ki, en_iyi_sd = b["ad"], p, ki, sd
+            if en_iyi is None or en_iyi_p >= p_giris:
+                break
+            secili = secili + [en_iyi]
+            adimlar.append({"adim": adim, "islem": "eklendi", "degisken": en_iyi,
+                            "ki2": _f(en_iyi_ki), "df": int(en_iyi_sd),
+                            "p": _f(en_iyi_p, 1.0),
+                            "kalan": list(secili)})
+    return secili, adimlar
+
+
+# --------------------------------------------------------------------------
+# Uyum iyiligi ve siniflandirma
+# --------------------------------------------------------------------------
+
+def _hosmer_lemeshow(y, p, grup=10):
+    """Hosmer-Lemeshow C istatistigi (tahmini olasiliga gore desil dilimleri)."""
+    n = y.size
+    if n < 2 * grup:
+        grup = max(4, n // 10)
+    sira = np.argsort(p, kind="mergesort")
+    dilimler = np.array_split(sira, grup)
+    satirlar, ki = [], 0.0
+    kullanilan = 0
+    for i, d in enumerate(dilimler, start=1):
+        if d.size == 0:
+            continue
+        o1 = float(y[d].sum())
+        e1 = float(p[d].sum())
+        o0, e0 = d.size - o1, d.size - e1
+        if e1 <= 0 or e0 <= 0:
+            continue
+        ki += (o1 - e1) ** 2 / e1 + (o0 - e0) ** 2 / e0
+        kullanilan += 1
+        satirlar.append({"dilim": i, "n": int(d.size),
+                         "gozlenen1": int(round(o1)), "beklenen1": _f(e1),
+                         "gozlenen0": int(round(o0)), "beklenen0": _f(e0)})
+    sd = max(kullanilan - 2, 1)
+    return {"chi2": _f(ki), "df": int(sd), "p": _f(stats.chi2.sf(ki, sd), 1.0),
+            "groups": satirlar}
+
+
+def _sinif_tablosu(y, tahmin, etiketler):
+    """Gozlenen x tahmin capraz tablosu ve dogru siniflandirma yuzdeleri."""
+    k = len(etiketler)
+    M = np.zeros((k, k), dtype=int)
+    for g, t in zip(y, tahmin):
+        M[int(g), int(t)] += 1
+    satirlar = []
+    for i, ad in enumerate(etiketler):
+        toplam = int(M[i].sum())
+        satirlar.append({"gozlenen": str(ad),
+                         "tahmin": [int(x) for x in M[i]],
+                         "n": toplam,
+                         "dogru": _f(100.0 * M[i, i] / toplam) if toplam else 0.0})
+    genel = _f(100.0 * np.trace(M) / max(M.sum(), 1))
+    return {"labels": [str(e) for e in etiketler], "rows": satirlar,
+            "overall": genel}
+
+
+# ==========================================================================
+
+@app.post("/logistic")
+def logistic(req: LogisticRequest):
+    try:
+        sayisal = [v for v in dict.fromkeys(req.numericVars or []) if v != req.depVar]
+        kategorik = []
+        gorulen = set()
+        for k in (req.categoricalVars or []):
+            ad = k.get("name")
+            if ad and ad != req.depVar and ad not in gorulen and ad not in sayisal:
+                gorulen.add(ad)
+                kategorik.append(k)
+        cols = [req.depVar] + sayisal + [k["name"] for k in kategorik]
+        bad = _guard(req.data, cols)
+        if bad:
+            return bad
+        if not sayisal and not kategorik:
+            return {"error": "En az bir bağımsız değişken seçmelisiniz."}
+        if len(sayisal) + len(kategorik) > MAX_LOJ_VARS:
+            return {"error": f"Aynı anda en fazla {MAX_LOJ_VARS} bağımsız değişken "
+                             f"analiz edilebilir."}
+
+        df = _frame(req.data, cols)
+        bad = _missing(df, cols)
+        if bad:
+            return bad
+
+        tur = (req.modelType or "binary").strip().lower()
+        if tur not in ("binary", "ordinal", "multinomial"):
+            tur = "binary"
+        yontem = (req.method or "enter").strip().lower()
+        if yontem not in ("enter", "backward", "forward"):
+            yontem = "enter"
+
+        # ---------------- bagimli degisken ----------------
+        df = df.dropna(subset=[req.depVar])
+        duzeyler = _sorted_levels(df[req.depVar])
+        if tur == "binary":
+            if len(duzeyler) != 2:
+                return {"error": f"İkili lojistik regresyon için bağımlı değişkende tam "
+                                 f"olarak 2 kategori olmalıdır. Sizde {len(duzeyler)} bulundu."}
+            poz = req.positive
+            eslesen = [g for g in duzeyler if str(g) == str(poz)]
+            poz = eslesen[0] if eslesen else duzeyler[-1]
+            neg = [g for g in duzeyler if str(g) != str(poz)][0]
+            siralı = [neg, poz]
+        else:
+            if len(duzeyler) < 3:
+                return {"error": f"Seçtiğiniz model türü için bağımlı değişkende en az 3 "
+                                 f"kategori olmalıdır. Sizde {len(duzeyler)} bulundu. "
+                                 f"İki kategorili değişkenlerde ikili modeli kullanınız."}
+            if len(duzeyler) > 8:
+                return {"error": f"Bağımlı değişkende {len(duzeyler)} kategori var; "
+                                 f"en fazla 8 kategori işlenebilir."}
+            if tur == "ordinal" and req.levelOrder:
+                istek = [str(x) for x in req.levelOrder]
+                varolan = {str(g): g for g in duzeyler}
+                if set(istek) == set(varolan.keys()):
+                    duzeyler = [varolan[x] for x in istek]
+            siralı = list(duzeyler)
+            if tur == "multinomial" and req.reference is not None:
+                es = [g for g in siralı if str(g) == str(req.reference)]
+                if es:
+                    siralı = [es[0]] + [g for g in siralı if str(g) != str(es[0])]
+
+        kod = {str(g): i for i, g in enumerate(siralı)}
+        y_tum = df[req.depVar].astype(str).map(kod)
+
+        # ---------------- tasarim matrisi ----------------
+        X_tum, bloklar, uyarilar = _loj_tasarim(df, sayisal, kategorik)
+        if X_tum.shape[1] == 0:
+            return {"error": "Geçerli bir bağımsız değişken kalmadı. " + " ".join(uyarilar)}
+
+        gecerli = y_tum.notna() & X_tum.notna().all(axis=1)
+        X_tum = X_tum[gecerli]
+        y = y_tum[gecerli].astype(int)
+        n_once, n = int(len(df)), int(len(y))
+        kSinif = len(siralı)
+        if n < X_tum.shape[1] + kSinif + 1:
+            return {"error": f"Geçerli veri sayısı yetersiz (n = {n}). "
+                             f"{X_tum.shape[1]} yordayıcı için daha fazla gözlem gereklidir."}
+        for i, g in enumerate(siralı):
+            if int((y == i).sum()) < 2:
+                return {"error": f"“{g}” kategorisinde yeterli gözlem yok "
+                                 f"({int((y == i).sum())}). Bu kategoriyi birleştirmeyi "
+                                 f"düşününüz."}
+
+        # sabit sutun ve tam baglanti kontrolu
+        sabit = [c for c in X_tum.columns if X_tum[c].nunique() < 2]
+        if sabit:
+            return {"error": "Şu değişken(ler) tek bir değerden oluşuyor ve modele "
+                             "giremez: " + ", ".join(sabit)}
+        Xm = sm.add_constant(X_tum, has_constant="add").to_numpy(dtype=float)
+        if np.linalg.matrix_rank(Xm) < Xm.shape[1]:
+            return {"error": "Bağımsız değişkenleriniz arasında tam doğrusal ilişki var; "
+                             "model tahmin edilemedi. Bu değişkenlerden birini çıkarınız "
+                             "(kategorik değişkenlerin birbirini tekrar etmediğinden "
+                             "emin olunuz)."}
+
+        # ---------------- degisken secimi ----------------
+        adimlar = []
+        if yontem in ("backward", "forward") and len(bloklar) > 1:
+            secili_ad, adimlar = _loj_stepwise(
+                tur, X_tum, y, bloklar, yontem,
+                float(req.pEnter or 0.05), float(req.pRemove or 0.10), kSinif)
+        else:
+            secili_ad = [b["ad"] for b in bloklar]
+        if not secili_ad:
+            return {"error": "Seçim yöntemi hiçbir değişkeni modelde tutmadı; "
+                             "hiçbir yordayıcı ölçütü karşılamıyor. Enter yöntemiyle "
+                             "deneyebilirsiniz."}
+        kullanilan_bloklar = [b for b in bloklar if b["ad"] in secili_ad]
+        kolonlar = [c for b in kullanilan_bloklar for c in b["sutunlar"]]
+        X = X_tum[kolonlar]
+
+        # ---------------- model ----------------
+        res = _loj_fit(tur, X, y, kSinif)
+        if res is None:
+            return {"error": "Model yakınsamadı. En sık nedeni, bir yordayıcının "
+                             "sonucu neredeyse kusursuz ayırmasıdır (tam ayrışma) ya da "
+                             "bazı kategorilerde gözlem sayısının çok az olmasıdır."}
+        bos = _loj_fit(tur, X.iloc[:, :0], y, kSinif)
+        ll_tam = float(res.llf)
+        ll_bos = float(bos.llf) if bos is not None else float("nan")
+
+        kPar = _loj_npar(tur, res, X, kSinif)
+        omnibus_ki = 2.0 * (ll_tam - ll_bos) if math.isfinite(ll_bos) else 0.0
+        omnibus_p = _f(stats.chi2.sf(max(omnibus_ki, 0.0), max(kPar, 1)), 1.0)
+        cox = 1.0 - math.exp(-omnibus_ki / n) if n > 0 else 0.0
+        cox_max = 1.0 - math.exp(2.0 * ll_bos / n) if math.isfinite(ll_bos) and n > 0 else 1.0
+        nagel = cox / cox_max if cox_max > 0 else 0.0
+
+        # ---------------- katsayilar ----------------
+        def _katsayi_satirlari(isimler, b, se):
+            cikti = []
+            for ad, bb, ss in zip(isimler, b, se):
+                wald = (bb / ss) ** 2 if ss and math.isfinite(ss) and ss > 0 else 0.0
+                p = float(stats.chi2.sf(wald, 1))
+                orr = math.exp(bb) if -700 < bb < 700 else None
+                lo = math.exp(bb - 1.959963984540054 * ss) if orr is not None and ss < 300 else None
+                hi = math.exp(bb + 1.959963984540054 * ss) if orr is not None and ss < 300 else None
+                cikti.append({"term": ad, "B": _f(bb), "SE": _f(ss),
+                              "wald": _f(wald), "df": 1, "p": _f(p, 1.0),
+                              "OR": _fo(orr), "orLow": _fo(lo), "orHigh": _fo(hi)})
+            return cikti
+
+        katsayilar, esikler, karsilastirmalar = [], [], []
+        if tur == "binary":
+            isim = list(sm.add_constant(X, has_constant="add").columns)
+            katsayilar = _katsayi_satirlari(isim, np.asarray(res.params, float),
+                                            np.asarray(res.bse, float))
+        elif tur == "ordinal":
+            p_all = np.asarray(res.params, float)
+            se_all = np.asarray(res.bse, float)
+            nx = X.shape[1]
+            katsayilar = _katsayi_satirlari(list(X.columns), p_all[:nx], se_all[:nx])
+            # esik (threshold) parametreleri kumulatif olceğe cevrilir
+            ham = p_all[nx:]
+            kesim = [float(ham[0])]
+            for t in ham[1:]:
+                kesim.append(kesim[-1] + math.exp(float(t)))
+            for i, c in enumerate(kesim):
+                esikler.append({"term": f"{siralı[i]} | {siralı[i+1]}", "B": _f(c),
+                                "SE": _f(se_all[nx + i])})
+        else:
+            P = np.asarray(res.params, float)
+            S = np.asarray(res.bse, float)
+            isim = list(sm.add_constant(X, has_constant="add").columns)
+            for j in range(P.shape[1]):
+                karsilastirmalar.append({
+                    "kategori": str(siralı[j + 1]),
+                    "referans": str(siralı[0]),
+                    "rows": _katsayi_satirlari(isim, P[:, j], S[:, j])})
+
+        # ---------------- kategorik degiskenler icin BLOK Wald sinamasi --------
+        # SPSS'te bir kategorik degiskenin satirinda, butun kuklalarini birlikte
+        # sinayan genel bir Wald degeri yer alir. Tek tek kuklalarin p degerleri
+        # "bu kategori referanstan farkli mi", blok Wald ise "bu DEGISKENIN
+        # butununun etkisi var mi" sorusunu yanitlar.
+        blok_testleri = {}
+        if tur in ("binary", "ordinal"):
+            try:
+                isimler = (list(sm.add_constant(X, has_constant="add").columns)
+                           if tur == "binary" else list(X.columns))
+                kov = np.asarray(res.cov_params(), dtype=float)
+                par = np.asarray(res.params, dtype=float)
+                for b in kullanilan_bloklar:
+                    # Tek kuklali (iki kategorili) degiskende de blok satiri
+                    # yazilir; orada Wald degeri kuklanin kendisiyle ayni cikar
+                    # ama satirin bos kalmasi tabloyu bozuk gosteriyordu.
+                    if b["tur"] != "kategorik" or len(b["sutunlar"]) < 1:
+                        continue
+                    idx = [isimler.index(c) for c in b["sutunlar"] if c in isimler]
+                    if len(idx) < 1:
+                        continue
+                    bb = par[idx]
+                    VV = kov[np.ix_(idx, idx)]
+                    try:
+                        W = float(bb @ np.linalg.solve(VV, bb))
+                    except np.linalg.LinAlgError:
+                        continue
+                    sd_b = len(idx)
+                    blok_testleri[b["ad"]] = {
+                        "wald": _f(W), "df": int(sd_b),
+                        "p": _f(stats.chi2.sf(max(W, 0.0), sd_b), 1.0)}
+            except Exception:
+                blok_testleri = {}
+
+        # ---------------- uyum, siniflandirma, ROC ----------------
+        hl, roc, sinif = None, None, None
+        y_np = y.to_numpy()
+        if tur == "binary":
+            p_hat = np.asarray(res.predict(), dtype=float)
+            hl = _hosmer_lemeshow(y_np.astype(float), p_hat)
+            tahmin = (p_hat >= 0.5).astype(int)
+            sinif = _sinif_tablosu(y_np, tahmin, [str(siralı[0]), str(siralı[1])])
+            GP = int(((y_np == 1) & (tahmin == 1)).sum())
+            YN = int(((y_np == 1) & (tahmin == 0)).sum())
+            YP = int(((y_np == 0) & (tahmin == 1)).sum())
+            GN = int(((y_np == 0) & (tahmin == 0)).sum())
+            sinif.update({"tp": GP, "fn": YN, "fp": YP, "tn": GN,
+                          "sens": _f(GP / (GP + YN)) if (GP + YN) else 0.0,
+                          "spec": _f(GN / (GN + YP)) if (GN + YP) else 0.0})
+            # ROC: modelin tahmin ettigi olasiliklar uzerinden
+            m1 = y_np == 1
+            if m1.sum() >= 3 and (~m1).sum() >= 3 and np.unique(p_hat).size > 1:
+                fpr, tpr, esik_r, tp_r, fp_r, P_, N_ = _roc_egrisi(p_hat, y_np.astype(float))
+                auc_v, S2 = _delong(p_hat[m1].reshape(1, -1), p_hat[~m1].reshape(1, -1))
+                auc = float(auc_v[0]); se_auc = float(math.sqrt(max(S2[0, 0], 0.0)))
+                _, tie_sum = _ranks_with_ties(p_hat)
+                NN = float(p_hat.size)
+                var0 = (m1.sum() * (~m1).sum() / 12.0) * ((NN + 1.0) - tie_sum / (NN * (NN - 1.0)))
+                se0 = math.sqrt(max(var0, 0.0)) / (m1.sum() * (~m1).sum()) if var0 > 0 else 0.0
+                z_auc = (auc - 0.5) / se0 if se0 > 0 else 0.0
+                secim = np.arange(fpr.size)
+                if fpr.size > MAX_ROC_POINTS:
+                    secim = np.unique(np.r_[np.linspace(0, fpr.size - 1,
+                                                        MAX_ROC_POINTS - 2).astype(int),
+                                            0, fpr.size - 1])
+                roc = {"auc": _f(auc), "se": _f(se_auc),
+                       "ciLow": _f(max(0.0, auc - 1.959963984540054 * se_auc)),
+                       "ciHigh": _f(min(1.0, auc + 1.959963984540054 * se_auc)),
+                       "z": _f(z_auc), "p": _f(2.0 * stats.norm.sf(abs(z_auc)), 1.0),
+                       "curve": [{"fpr": _f(fpr[i]), "tpr": _f(tpr[i])} for i in secim]}
+        else:
+            olasilik = np.asarray(res.predict(), dtype=float)
+            if olasilik.ndim == 1:
+                olasilik = np.column_stack([1 - olasilik, olasilik])
+            tahmin = olasilik.argmax(axis=1)
+            sinif = _sinif_tablosu(y_np, tahmin, [str(g) for g in siralı])
+
+        # ---------------- sirali modelde paralel egrilik sinamasi ----------------
+        paralel = None
+        if tur == "ordinal":
+            paralel = _brant(X, y, kSinif, kullanilan_bloklar)
+
+        # ---------------- tam ayrisma (separation) tespiti ----------------
+        # Kusursuz ayrimda en cok olabilirlik kestirimi sonsuza gider: katsayilar
+        # ve standart hatalar patlar, odds orani anlamsiz buyuklukte cikar.
+        # Sayilari gizlemiyoruz ama isaretliyoruz ki yorumlanmasin.
+        ayrisma = []
+        for c in katsayilar:
+            if abs(c["B"]) > 12 or c["SE"] > 20:
+                ayrisma.append(c["term"])
+        for k in karsilastirmalar:
+            for c in k["rows"]:
+                if abs(c["B"]) > 12 or c["SE"] > 20:
+                    ayrisma.append(f"{k['kategori']}: {c['term']}")
+        ayrisma = [a for a in dict.fromkeys(ayrisma) if a != "const"]
+        if ayrisma:
+            uyarilar.append(
+                "Şu terimlerde katsayı ve standart hata olağandışı büyük: "
+                + ", ".join(ayrisma)
+                + ". Bu, yordayıcının sonucu neredeyse kusursuz ayırdığı (tam ya da "
+                  "yarı ayrışma) durumun işaretidir; odds oranları ve güven "
+                  "aralıkları yorumlanamaz. İlgili değişkeni modelden çıkarmayı ya da "
+                  "kategorileri birleştirmeyi düşününüz.")
+
+        return {
+            "separation": ayrisma,
+            "test": {"binary": "İkili Lojistik Regresyon",
+                     "ordinal": "Sıralı (Orantılı Odds) Lojistik Regresyon",
+                     "multinomial": "Çok Kategorili Lojistik Regresyon"}[tur],
+            "modelType": tur, "method": yontem,
+            "depVar": req.depVar,
+            "levels": [str(g) for g in siralı],
+            "positive": str(siralı[1]) if tur == "binary" else None,
+            "negative": str(siralı[0]) if tur == "binary" else None,
+            "reference": str(siralı[0]) if tur == "multinomial" else None,
+            "n": n, "nDropped": int(n_once - n),
+            "counts": {str(g): int((y == i).sum()) for i, g in enumerate(siralı)},
+            "blocks": [{"ad": b["ad"], "tur": b["tur"], "ref": b["ref"],
+                        "sutunlar": b["sutunlar"]} for b in kullanilan_bloklar],
+            "excluded": [b["ad"] for b in bloklar if b["ad"] not in secili_ad],
+            "steps": adimlar,
+            "ll": _f(ll_tam), "llNull": _f(ll_bos),
+            "minus2LL": _f(-2.0 * ll_tam),
+            "omnibus": {"chi2": _f(omnibus_ki), "df": int(kPar), "p": omnibus_p},
+            "coxSnell": _f(cox), "nagelkerke": _f(min(max(nagel, 0.0), 1.0)),
+            "aic": _f(res.aic) if hasattr(res, "aic") else None,
+            "bic": _f(res.bic) if hasattr(res, "bic") else None,
+            "coefficients": katsayilar,
+            "blockTests": blok_testleri,
+            "thresholds": esikler,
+            "comparisons": karsilastirmalar,
+            "hosmerLemeshow": hl,
+            "classification": sinif,
+            "roc": roc,
+            "parallelLines": paralel,
+            "warnings": uyarilar,
+        }
+    except Exception as e:
+        log.exception("logistic failed")
+        return {"error": f"Lojistik Regresyon Hatası: {e}"}
     finally:
         gc.collect()
 
